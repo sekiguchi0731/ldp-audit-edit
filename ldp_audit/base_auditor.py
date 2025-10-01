@@ -1,31 +1,35 @@
 # General imports
-import warnings; warnings.simplefilter('ignore')
-from numba.core.errors import NumbaExperimentalFeatureWarning
-import numpy as np
-from statsmodels.stats.proportion import proportion_confint
-import xxhash
-from scipy.optimize import minimize_scalar
+import warnings
 from collections import defaultdict
+from typing import Any, Self
 
-# Import LDP protocols (by default from multi-freq-ldpy package -- https://github.com/hharcolezi/multi-freq-ldpy)
-from multi_freq_ldpy.pure_frequency_oracles.GRR import GRR_Client
-from multi_freq_ldpy.pure_frequency_oracles.UE import UE_Client
-from multi_freq_ldpy.pure_frequency_oracles.SS import SS_Client
-from multi_freq_ldpy.pure_frequency_oracles.LH import LH_Client
-from multi_freq_ldpy.pure_frequency_oracles.HE import HE_Client
-
-# Import UE protocols from pure-ldp package (https://github.com/Samuel-Maddock/pure-LDP)
-from pure_ldp.frequency_oracles.unary_encoding import UEClient, UEServer
-
-# Our imports
-from .utils import setting_seed, find_tresh
-from .attacks import attack_ss, attack_ue, attack_the, attack_she, attack_lh, attack_gm
-from .approximate_ldp import find_scale, GM_Client, AGRR_Client, ASUE_Client, ALH_Client
+import numpy as np
+import psutil
 
 # Imports for parallelization
 import ray
-import psutil
+import xxhash
 
+# Import LDP protocols (by default from multi-freq-ldpy package -- https://github.com/hharcolezi/multi-freq-ldpy)
+from multi_freq_ldpy.pure_frequency_oracles.GRR import GRR_Client
+from multi_freq_ldpy.pure_frequency_oracles.HE import HE_Client
+from multi_freq_ldpy.pure_frequency_oracles.LH import LH_Client
+from multi_freq_ldpy.pure_frequency_oracles.SS import SS_Client
+from multi_freq_ldpy.pure_frequency_oracles.UE import UE_Client
+from numba.core.errors import NumbaExperimentalFeatureWarning
+
+# Import UE protocols from pure-ldp package (https://github.com/Samuel-Maddock/pure-LDP)
+from pure_ldp.frequency_oracles.unary_encoding import UEClient
+from scipy.optimize import OptimizeResult, minimize_scalar
+from statsmodels.stats.proportion import proportion_confint
+
+from .approximate_ldp import AGRR_Client, ALH_Client, ASUE_Client, GM_Client, find_scale
+from .attacks import attack_gm, attack_lh, attack_she, attack_ss, attack_the, attack_ue
+
+# Our imports
+from .utils import find_tresh, setting_seed
+
+warnings.simplefilter("ignore")
 class LDPAuditor:
     """
     The LDPAuditor class is designed to audit various Local Differential Privacy (LDP) protocols.
@@ -36,9 +40,16 @@ class LDPAuditor:
         Runs the audit for the specified LDP protocol and returns the estimated empirical epsilon value eps_emp.
     """
 
-    def __init__(self, nb_trials: int = int(1e6), alpha: float = 1e-2, 
-                 epsilon: float = 0.25, delta: float = 0.0, k: int = 2,
-                 random_state: int = 42, n_jobs: int = -1):
+    def __init__(
+        self,
+        nb_trials: int = int(1e6),
+        alpha: float = 1e-2,
+        epsilon: float = 0.25,
+        delta: float = 0.0,
+        k: int = 2,
+        random_state: int = 42,
+        n_jobs: int = -1,
+    ) -> None:
         """
         Initializes the LDPAuditor with the specified parameters.
 
@@ -77,57 +88,58 @@ class LDPAuditor:
             raise ValueError("n_jobs must be a positive integer > 0 or -1")
 
         # for reproducibility
-        self.random_state = random_state
+        self.random_state: int = random_state
 
         # audit parameters
-        self.nb_trials = nb_trials
-        self.alpha = alpha
-        self.k = k # domain size
+        self.nb_trials: int = nb_trials
+        self.alpha: float = alpha
+        self.k: int = k  # domain size
         self.v1 = 0
-        self.v2 = k - 1
+        self.v2: int = k - 1
         self.eps_emp = 0 # estimated empirical epsilon
 
         # theoretical LDP guarantees
-        self.delta = delta        
-        self.epsilon = epsilon     
+        self.delta: float | int = delta
+        self.epsilon: float | int = epsilon
 
         # for ray parallelism
+        cpu_count: int | None = psutil.cpu_count()
+        available_cores: int = int(cpu_count) if cpu_count is not None else 1
         if n_jobs == -1:
-            self.nb_cores = psutil.cpu_count()
+            self.nb_cores: int = available_cores
         else:
-            self.nb_cores = min(psutil.cpu_count(), n_jobs)
+            self.nb_cores = min(available_cores, n_jobs)
         
         ray.shutdown()
         ray.init(num_cpus=self.nb_cores)
-        self.lst_trial_per_core = [len(list(_)) for _ in np.array_split(range(nb_trials), self.nb_cores)]
+        self.lst_trial_per_core: list[int] = [
+            len(list(_)) for _ in np.array_split(range(nb_trials), self.nb_cores)
+        ]
 
         # possible protocols to audit
-        self.protocols = {
-
+        self.protocols: dict[str, Any] = {
             # pure LDP protocols
             "GRR": self.audit_grr,
-            "SS":  self.audit_ss,
+            "SS": self.audit_ss,
             "SUE": self.audit_sue,
             "OUE": self.audit_oue,
             "THE": self.audit_the,
             "SHE": self.audit_she,
             "BLH": self.audit_blh,
             "OLH": self.audit_olh,
-
             # approximate LDP protocols
             "AGRR": self.audit_agrr,
             "ASUE": self.audit_asue,
-            "AGM":  self.audit_agm,
-            "GM":   self.audit_gm,
+            "AGM": self.audit_agm,
+            "GM": self.audit_gm,
             "ABLH": self.audit_ablh,
             "AOLH": self.audit_aolh,
-
             # UE protocols from pure-ldp package (version 1.1.2)
             "SUE_pure_ldp_pck": self.audit_sue_pure_ldp_pck,
             "OUE_pure_ldp_pck": self.audit_oue_pure_ldp_pck,
         }
 
-    def set_params(self, **params):
+    def set_params(self, **params) -> Self:
         """
         Code modified from scikit-learn package (Copyright (c) 2007-2024 The scikit-learn developers): 
         https://github.com/scikit-learn/scikit-learn/blob/5491dc695/sklearn/base.py#L251
@@ -145,9 +157,11 @@ class LDPAuditor:
         if not params:
             # Simple optimization to gain speed (inspect is slow)
             return self
-        valid_params = self.get_params()
+        valid_params: dict[str, Any] = self.get_params()
 
-        nested_params = defaultdict(dict)  # grouped by prefix
+        nested_params: defaultdict[str, dict[str, Any]] = defaultdict(
+            dict
+        )  # grouped by prefix
         for key, value in params.items():
             key, delim, sub_key = key.partition("__")
             if key not in valid_params:
@@ -167,7 +181,7 @@ class LDPAuditor:
 
         return self
 
-    def get_params(self):
+    def get_params(self) -> dict[str, Any]:
         """
         Get the parameters of the LDPAuditor.
 
@@ -187,7 +201,9 @@ class LDPAuditor:
         }
 
     @ray.remote
-    def audit_grr(self, random_state, trials, v, k, epsilon, delta, test_statistic):
+    def audit_grr(
+        self, random_state, trials, v, k, epsilon, delta, test_statistic
+    ) -> int:
         """
         Audits the Generalized Randomized Response (GRR) protocol.
 
@@ -224,9 +240,11 @@ class LDPAuditor:
         for _ in range(trials):            
             count += GRR_Client(v, k, epsilon) == test_statistic
         return count
-       
+
     @ray.remote
-    def audit_ss(self, random_state, trials, v, k, epsilon, delta, test_statistic):
+    def audit_ss(
+        self, random_state, trials, v, k, epsilon, delta, test_statistic
+    ) -> int:
         """
         Audits the Subset Selection (SS) protocol.
 
@@ -265,7 +283,9 @@ class LDPAuditor:
         return count
 
     @ray.remote
-    def audit_sue(self, random_state, trials, v, k, epsilon, delta, test_statistic):
+    def audit_sue(
+        self, random_state, trials, v, k, epsilon, delta, test_statistic
+    ) -> int:
         """
         Audits the Symmetric Unary Encoding (SUE -- a.k.a. RAPPOR) protocol.
 
@@ -304,7 +324,9 @@ class LDPAuditor:
         return count
     
     @ray.remote
-    def audit_oue(self, random_state, trials, v, k, epsilon, delta, test_statistic):
+    def audit_oue(
+        self, random_state, trials, v, k, epsilon, delta, test_statistic
+    ) -> int:
         """
         Audits the Optimized Unary Encoding (OUE) protocol.
 
@@ -343,7 +365,9 @@ class LDPAuditor:
         return count
 
     @ray.remote
-    def audit_the(self, random_state, trials, v, k, epsilon, delta, test_statistic):
+    def audit_the(
+        self, random_state, trials, v, k, epsilon, delta, test_statistic
+    ) -> int:
         """
         Audits the Thresholding with Histogram Encoding (THE) protocol.
 
@@ -376,14 +400,22 @@ class LDPAuditor:
         setting_seed(random_state)
         np.random.seed(random_state)
 
-        thresh = minimize_scalar(find_tresh, bounds=[0.5, 1], method='bounded', args=(epsilon)).x 
+        res: OptimizeResult = minimize_scalar(
+            find_tresh,
+            bounds=[0.5, 1],
+            method="bounded",
+            args=(epsilon,),
+        )
+        thresh = float(res.x)
         count = 0
         for _ in range(trials):
             count += attack_the(HE_Client(v, k, epsilon), k, thresh) == test_statistic
         return count
     
     @ray.remote
-    def audit_she(self, random_state, trials, v, k, epsilon, delta, test_statistic):
+    def audit_she(
+        self, random_state, trials, v, k, epsilon, delta, test_statistic
+    ) -> int:
         """
         Audits the Summation with Histogram Encoding (SHE) protocol.
 
@@ -422,7 +454,9 @@ class LDPAuditor:
         return count
     
     @ray.remote
-    def audit_blh(self, random_state, trials, v, k, epsilon, delta, test_statistic):
+    def audit_blh(
+        self, random_state, trials, v, k, epsilon, delta, test_statistic
+    ) -> int:
         """
         Audits the Binary Local Hashing (BLH) protocol.
 
@@ -462,7 +496,9 @@ class LDPAuditor:
         return count
     
     @ray.remote
-    def audit_olh(self, random_state, trials, v, k, epsilon, delta, test_statistic):
+    def audit_olh(
+        self, random_state, trials, v, k, epsilon, delta, test_statistic
+    ) -> int:
         """
         Audits the Optimal Local Hashing (OLH) protocol.
 
@@ -500,10 +536,12 @@ class LDPAuditor:
         for _ in range(trials):
             count += attack_lh(LH_Client(v, k, epsilon, True), k, g) == test_statistic
         return count
-       
+
     #================================= Audit Methods for Approximate LDP Protocols =================================
     @ray.remote
-    def audit_agrr(self, random_state, trials, v, k, epsilon, delta, test_statistic):
+    def audit_agrr(
+        self, random_state, trials, v, k, epsilon, delta, test_statistic
+    ) -> int:
         """
         Audits the Approximate Generalized Randomized Response (AGRR) protocol.
 
@@ -542,7 +580,9 @@ class LDPAuditor:
         return count
     
     @ray.remote
-    def audit_asue(self, random_state, trials, v, k, epsilon, delta, test_statistic):
+    def audit_asue(
+        self, random_state, trials, v, k, epsilon, delta, test_statistic
+    ) -> int:
         """
         Audits the Approximate Symmetric Unary Encoding (ASUE) protocol.
 
@@ -581,7 +621,9 @@ class LDPAuditor:
         return count
 
     @ray.remote
-    def audit_agm(self, random_state, trials, v, k, epsilon, delta, test_statistic):
+    def audit_agm(
+        self, random_state, trials, v, k, epsilon, delta, test_statistic
+    ) -> int:
         """
         Audits the Analytical Gaussian Mechanism (AGM).
 
@@ -624,7 +666,9 @@ class LDPAuditor:
         return count
 
     @ray.remote
-    def audit_gm(self, random_state, trials, v, k, epsilon, delta, test_statistic):
+    def audit_gm(
+        self, random_state, trials, v, k, epsilon, delta, test_statistic
+    ) -> int:
         """
         Audits the Gaussian Mechanism (GM).
 
