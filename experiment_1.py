@@ -1,36 +1,110 @@
 # general imports
-import numpy as np
-import pandas as pd
-import os
-from tqdm import tqdm
 import logging
+import os
+from typing import Iterable, List, Sequence, TypedDict
+
+import pandas as pd
+from numpy._typing._array_like import NDArray
+from tqdm import tqdm
 
 # Our imports
 from ldp_audit.base_auditor import LDPAuditor
-from plot_functions import plot_results_example_audit, plot_results_pure_ldp_protocols, plot_results_approx_ldp_protocols
+from plot_functions import (
+    plot_results_approx_ldp_protocols,
+    plot_results_example_audit,
+    plot_results_pure_ldp_protocols,
+)
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Ensure the results directory exists
+# ---------------------------------------------------------------------
+# Logging / IO setup
+# ---------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 os.makedirs('results', exist_ok=True)
 
+# ---------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------
+class ResultsDict(TypedDict):
+    """結果CSVへ書き出す各列の型"""
+
+    seed: List[int]
+    protocol: List[str]
+    k: List[int]  # カテゴリ数（ラベルの種類数）
+    delta: List[float]
+    epsilon: List[float]
+    eps_emp: List[float]  # 監査で得た経験的 ε（スカラー）
+
+
+# ---------------------------------------------------------------------
 # Main audit results
+# ---------------------------------------------------------------------
+def run_main_experiments(
+    nb_trials: int,
+    alpha: float,
+    lst_protocols: Sequence[str],
+    lst_seed: Iterable[int],
+    lst_k: Sequence[int],
+    lst_eps: Sequence[float],
+    delta: float,
+    analysis: str,
+) -> pd.DataFrame:
+    """
+    乱数シード・カテゴリ数 k・ε（および δ）・プロトコルの組み合わせを受け取り
+    LDP 監査を実行し，経験的な ε（eps_emp）を集計して CSV に保存し，
+    同じ内容を pd.DataFrame として返す関数
 
-def run_main_experiments(nb_trials: int, alpha: float, lst_protocols: list, lst_seed: list, lst_k: list, lst_eps: list, delta: float, analysis: str):
-    
+    Parameters
+    ----------
+    nb_trials : int
+        監査内部で用いる試行回数（モンテカルロ反復やサンプル生成回数など）
+        大きいほど推定精度は上がるが計算コストが増加
+    alpha : float
+        有意水準（監査の統計的判定で使用）.例: 1e-2 (= 0.01)
+    lst_protocols : Sequence[str]
+        評価対象の LDP プロトコル名（例: 'GRR', 'OUE', 'BLH' など）の列
+        Sequence は list, tuple, str, ndarray などの，抽象的な「順序付きコレクション」
+        Iterable とは異なり，インデックスアクセスや len() が可能
+    lst_seed : Iterable[int]
+        乱数シードの集まり（range や list）.再現性・分散評価のために複数指定可能
+        Iterable は, for で回せるオブジェクトのこと
+        list, tuple, set, dict, str, range, generator などが該当
+    lst_k : Sequence[int]
+        カテゴリ数 k の候補（例: [25, 50, 100, ...]）。
+    lst_eps : Sequence[float]
+        プライバシー予算 ε の候補（例: [0.25, 0.5, 1, 2, ...]）。
+    delta : float
+        近似 DP の δ。純粋 DP の場合は 0.0。
+    analysis : str
+        出力 CSV のファイル名識別子（例: 'main_pure_ldp_protocols'）。
+
+    Returns
+    -------
+    pd.DataFrame
+        列: ['seed','protocol','k','delta','epsilon','eps_emp'] を持つ結果データフレーム。
+        同内容を `results/ldp_audit_results_{analysis}.csv` にも保存。
+    """
     # Initialize dictionary to save results
-    results = {
-            'seed': [],
-            'protocol': [],
-            'k': [],
-            'delta': [],
-            'epsilon': [],    
-            'eps_emp': []
-            }
+    results: dict[str, list] = {
+        "seed": [],
+        "protocol": [],
+        "k": [],
+        "delta": [],
+        "epsilon": [],
+        "eps_emp": [],
+    }
 
-    # Initialize LDP-Auditor
-    auditor = LDPAuditor(nb_trials=nb_trials, alpha=alpha, epsilon=lst_eps[0], delta=delta, k=lst_k[0], random_state=lst_seed[0], n_jobs=-1)
+    # Initialize LDP-Auditor（初期値は後で set_params で上書きする）
+    auditor: LDPAuditor = LDPAuditor(
+        nb_trials=nb_trials,
+        alpha=alpha,
+        epsilon=lst_eps[0],
+        delta=delta,
+        k=lst_k[0],
+        random_state=next(iter(lst_seed)) if hasattr(lst_seed, "__iter__") else 0,
+        n_jobs=-1,
+    )
 
     # Run the experiments
     for seed in lst_seed:    
@@ -41,8 +115,8 @@ def run_main_experiments(nb_trials: int, alpha: float, lst_protocols: list, lst_
                 # Update the auditor parameters
                 auditor.set_params(epsilon=epsilon, k=k, random_state=seed)
 
-                for protocol in tqdm(lst_protocols, desc=f'seed={seed}, k={k}, epsilon={epsilon}'):    
-                    eps_emp = auditor.run_audit(protocol)                    
+                for protocol in tqdm(lst_protocols, desc=f'seed={seed}, k={k}, epsilon={epsilon}'):
+                    eps_emp: NDArray = auditor.run_audit(protocol)
                     results['seed'].append(seed)
                     results['protocol'].append(protocol)
                     results['k'].append(k)
@@ -56,25 +130,59 @@ def run_main_experiments(nb_trials: int, alpha: float, lst_protocols: list, lst_
     
     return df
 
+
+# ---------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------
 if __name__ == "__main__":
     ## General parameters
-    lst_eps = [0.25, 0.5, 0.75, 1, 2, 4, 6, 10]
-    lst_k = [25, 50, 100, 150, 200]
+    lst_eps: list[float] = [0.25, 0.5, 0.75, 1, 2, 4, 6, 10]
+    lst_k: list[int] = [25, 50, 100, 150, 200]
     lst_seed = range(5)
     nb_trials = int(1e6)
     alpha = 1e-2
 
     ## pure LDP protocols
-    pure_ldp_protocols = ['GRR', 'SS', 'SUE', 'OUE', 'THE', 'SHE', 'BLH', 'OLH']
+    pure_ldp_protocols: list[str] = [
+        "GRR",
+        "SS",
+        "SUE",
+        "OUE",
+        "THE",
+        "SHE",
+        "BLH",
+        "OLH",
+    ]
     delta = 0.0 
     analysis_pure = 'main_pure_ldp_protocols'
-    df_pure = run_main_experiments(nb_trials, alpha, pure_ldp_protocols, lst_seed, lst_k, lst_eps, delta, analysis_pure)
-    plot_results_example_audit(df_pure, pure_ldp_protocols, epsilon = 2.0, k = 200) # Example of audit results -- Figure 1 in paper
-    plot_results_pure_ldp_protocols(df_pure, analysis_pure, pure_ldp_protocols, lst_eps, lst_k) # Main results -- Figure 2 in paper
+    df_pure: pd.DataFrame = run_main_experiments(
+        nb_trials,
+        alpha,
+        pure_ldp_protocols,
+        lst_seed,
+        lst_k,
+        lst_eps,
+        delta,
+        analysis_pure,
+    )
+    # Figure 1: Example of audit results for pure LDP protocols
+    plot_results_example_audit(df_pure, pure_ldp_protocols, epsilon=2.0, k=200)  # Example of audit results -- Figure 1 in paper
+    # Figure 2: Main results for pure LDP protocols
+    plot_results_pure_ldp_protocols(df_pure, analysis_pure, pure_ldp_protocols, lst_eps, lst_k)  # Main results -- Figure 2 in paper
 
     ## approximate LDP protocols
-    approx_ldp_protocols = ['AGRR', 'ASUE', 'ABLH', 'AOLH', 'GM', 'AGM']
+    approx_ldp_protocols: list[str] = ["AGRR", "ASUE", "ABLH", "AOLH", "GM", "AGM"]
     delta = 1e-5
     analysis_approx = 'main_approx_ldp_protocols'
-    df_approx = run_main_experiments(nb_trials, alpha, approx_ldp_protocols, lst_seed, lst_k, lst_eps, delta, analysis_approx)
-    plot_results_approx_ldp_protocols(df_approx, analysis_approx, approx_ldp_protocols, lst_eps, lst_k) # Main results -- Figure 3 in paper
+    df_approx: pd.DataFrame = run_main_experiments(
+        nb_trials,
+        alpha,
+        approx_ldp_protocols,
+        lst_seed,
+        lst_k,
+        lst_eps,
+        delta,
+        analysis_approx,
+    )
+    # Figure 3: Main results for approximate LDP protocols
+    plot_results_approx_ldp_protocols(df_approx, analysis_approx, approx_ldp_protocols, lst_eps, lst_k)  # Main results -- Figure 3 in paper
