@@ -3,6 +3,129 @@ import numpy as np
 from numba import jit, prange
 import xxhash
 
+# --- GRR(k=2) のチャネルパラメータ ---
+@jit(nopython=True)
+def _grr_pq_binary(epsilon: float) -> tuple[float, float]:
+    exp_eps: float = np.exp(epsilon)
+    p: float = exp_eps / (exp_eps + 1.0)  # P( \tilde y = y | y )
+    q: float = 1.0 - p  # P( \tilde y != y | y )
+    return p, q
+
+
+# --- 単一点の LRT 対数スコア ---
+@jit(nopython=True)
+def attack_lrt_score(ytilde: int, eta: float, epsilon: float) -> float:
+    """
+    Λ(x,\tilde y) = log( P(\tilde y|Y=1)*eta / (P(\tilde y|Y=0)*(1-eta)) )
+    ** log を取ることで，積は和に，割り算は差に変換されるため，数値安定性が向上する **
+    - \tilde y: 0/1
+    - eta     : P(Y=1|X=x) in (0,1)
+    - epsilon : RR の ε (>0)
+    """
+    p, q = _grr_pq_binary(epsilon)
+    if eta <= 1e-15:
+        eta = 1e-15
+    if eta >= 1.0 - 1e-15:
+        eta = 1.0 - 1e-15
+
+    if ytilde == 1:
+        return np.log(p * eta) - np.log(q * (1.0 - eta))
+    else:
+        return np.log(q * eta) - np.log(p * (1.0 - eta))
+
+
+# --- ベクトル版スコア ---
+@jit(nopython=True, parallel=True)
+def attack_lrt_scores(
+    ytilde_arr: np.ndarray, eta_arr: np.ndarray, epsilon: float
+) -> np.ndarray:
+    n: int = ytilde_arr.shape[0]
+    out: np.ndarray = np.empty(n, dtype=np.float64)
+    for i in prange(n):
+        out[i] = attack_lrt_score(int(ytilde_arr[i]), float(eta_arr[i]), float(epsilon))
+    return out
+
+
+# --- しきい値 τ を与えて 0/1 予測（score >= tau -> 1） ---
+@jit(nopython=True, parallel=True)
+def attack_lrt_predict(
+    ytilde_arr: np.ndarray, eta_arr: np.ndarray, epsilon: float, tau: float
+) -> np.ndarray:
+    n: int = ytilde_arr.shape[0]
+    yhat: np.ndarray = np.empty(n, dtype=np.int64)
+    for i in prange(n):
+        s: float = attack_lrt_score(int(ytilde_arr[i]), float(eta_arr[i]), float(epsilon))
+        yhat[i] = 1 if s >= tau else 0
+    return yhat
+
+
+def choose_tau_max_tpr_over_fpr(
+    scores: np.ndarray,
+    y_true: np.ndarray,
+    clip: float = 1e-12,
+) -> tuple[float, float, float]:
+    """
+    validation の (scores, y_true) から TPR/FPR を最大化する τ* を見つける。
+    返り値は (tau_star, tpr_at_tau_star, fpr_at_tau_star)。
+
+    実装メモ:
+    - スコアを降順に並べ、各しきい値での (TPR, FPR) を1回の走査で計算。
+    - 同一スコア値で重複計算しないよう unique 位置だけ評価。
+    - 数値不安定を避けるため FPR は clip で下駄をはかせる（ゼロ割回避）。
+    """
+    if scores.ndim != 1 or y_true.ndim != 1 or scores.size != y_true.size:
+        raise ValueError("scores と y_true は同長の1次元配列である必要があります。")
+    y_true = y_true.astype(np.int64, copy=False)
+    if not (np.any(y_true == 0) and np.any(y_true == 1)):
+        raise ValueError("y_true は 0/1 の両方を含む必要があります。")
+
+    # 降順ソート
+    order: np.ndarray = np.argsort(scores)[::-1]
+    s: np.ndarray = scores[order]
+    y: np.ndarray = y_true[order]
+
+    # 累積で TP/FP を積む（score >= tau を陽性とする規則）
+    P = float(np.sum(y == 1))
+    N = float(np.sum(y == 0))
+    # cum_pos[i]: スコア上位 i 個のうち何個が Y=1 か
+    # cum_neg[i]: スコア上位 i 個のうち何個が Y=0 か
+    cum_pos: np.ndarray = np.cumsum(y == 1).astype(np.float64)
+    cum_neg: np.ndarray = np.cumsum(y == 0).astype(np.float64)
+    # tpr_all[i] = TPR at threshold s[i]
+    # fpr_all[i] = FPR at threshold s[i]
+    tpr_all = cum_pos / P
+    fpr_all = cum_neg / N
+
+    # 同じスコア値が連続している場合、それらの間では判定結果が変わらないため、スコア値が変化する地点だけ評価する
+    # unique_mask: np.ndarray = np.r_[True, s[1:] < s[:-1]]
+
+    # tpr_u: np.ndarray = tpr_all[unique_mask]
+    # fpr_u: np.ndarray = fpr_all[unique_mask]
+    # tau_u: np.ndarray = s[unique_mask]
+
+    # クリップ付きの各 tau_u[i] における TPR/FPR 比（ゼロ割・無限大の暴発を抑制）
+    # ratios = (tpr_u + clip) / np.maximum(fpr_u, clip)
+
+    J = tpr_all - fpr_all
+
+    # -ratios: TPR/FPR 比の降順→その中でも FPR 昇順→その中でも TPR 降順
+    # np.lexsort は最後のキーが最も優先されるので、上記の順番で指定する
+    # タイブレーク： 同点の時にどっちを勝ちにするか決めるルール
+    # idx = int(np.lexsort((-tpr_u, fpr_u, -ratios))[-1])
+    # return float(tau_u[idx]), float(tpr_u[idx]), float(fpr_u[idx])
+    idx = np.argmax(J)
+    return float(s[idx]), float(tpr_all[idx]), float(fpr_all[idx])
+
+
+def compute_tpr_fpr(
+    scores: np.ndarray, y_true: np.ndarray, tau: float
+) -> tuple[float, float]:
+    pos: np.ndarray = y_true == 1
+    neg: np.ndarray = ~pos
+    tpr: float = float(np.mean(scores[pos] >= tau)) if np.any(pos) else 0.0
+    fpr: float = float(np.mean(scores[neg] >= tau)) if np.any(neg) else 0.0
+    return tpr, fpr
+
 @jit(nopython=True)
 def attack_ss(ss):
     """
