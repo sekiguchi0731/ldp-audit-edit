@@ -213,14 +213,18 @@ def attack_she(y, k, epsilon):
         A random inference of the true value.
     """
 
-    v_likelihood = np.zeros(k)
-    for v in prange(k):
-        x_v = np.zeros(k)
-        x_v[v] = 1
-        v_likelihood[v] = np.prod(np.exp(-np.abs(y - x_v) / (2/epsilon)))
-    posterior_v = v_likelihood / np.sum(v_likelihood)
-    m = max(posterior_v) 
-    return np.random.choice(np.where(posterior_v == m)[0])
+    # v_likelihood = np.zeros(k)
+    # for v in prange(k):
+    #     x_v = np.zeros(k)
+    #     x_v[v] = 1
+    #     v_likelihood[v] = np.prod(np.exp(-np.abs(y - x_v) / (2/epsilon)))
+    # posterior_v = v_likelihood / np.sum(v_likelihood)
+    # m = max(posterior_v) 
+    # return np.random.choice(np.where(posterior_v == m)[0])
+
+    # Equivalent and much faster (see [1])
+    # [1] Arcolezi, Héber H., and Sébastien Gambs. "Revisiting Locally Differentially Private Protocols: Towards Better Trade-offs in Privacy, Utility, and Attack Resistance." arXiv preprint arXiv:2503.01482 (2025).
+    return np.argmax(y)
 
 def attack_lh(val_seed, k, g):
     """
