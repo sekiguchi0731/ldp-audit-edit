@@ -24,10 +24,21 @@ from scipy.optimize import OptimizeResult, minimize_scalar
 from statsmodels.stats.proportion import proportion_confint
 
 from .approximate_ldp import AGRR_Client, ALH_Client, ASUE_Client, GM_Client, find_scale
-from .attacks import attack_gm, attack_lh, attack_she, attack_ss, attack_the, attack_ue
+from .attacks import (
+    attack_gm,
+    attack_lh,
+    attack_she,
+    attack_ss,
+    attack_the,
+    attack_ue,
+    attack_lrt_scores,
+    compute_tpr_fpr,
+    choose_tau_max_tpr_over_fpr,
+)
 
 # Our imports
 from .utils import find_tresh, setting_seed
+from .simulation import MixtureSpec, log_Rmax_effective_gaussian
 
 warnings.simplefilter("ignore")
 class LDPAuditor:
@@ -49,6 +60,8 @@ class LDPAuditor:
         k: int = 2,
         random_state: int = 42,
         n_jobs: int = -1,
+        rmax_alpha: float = 0.01,
+        spec: MixtureSpec | None = None,
     ) -> None:
         """
         Initializes the LDPAuditor with the specified parameters.
@@ -86,6 +99,8 @@ class LDPAuditor:
             raise ValueError("random_state must be a non-negative integer")
         if not isinstance(n_jobs, int) or n_jobs < -1 or n_jobs == 0:
             raise ValueError("n_jobs must be a positive integer > 0 or -1")
+        if not isinstance(rmax_alpha, float) or not (0.0 < rmax_alpha < 1.0):
+            raise ValueError("rmax_alpha must be in (0,1)")
 
         # for reproducibility
         self.random_state: int = random_state
@@ -94,14 +109,21 @@ class LDPAuditor:
         self.nb_trials: int = nb_trials
         self.alpha: float = alpha
         self.k: int = k  # domain size
-        self.v1 = 0
+        self.v1: int = 0
         self.v2: int = k - 1
-        self.eps_emp = 0 # estimated empirical epsilon
+        self.eps_emp: float = 0 # estimated empirical epsilon
 
         # theoretical LDP guarantees
         self.delta: float | int = delta
         self.epsilon: float | int = epsilon
 
+        self.eta_val: np.ndarray | None = None
+        self.eta_test: np.ndarray | None = None
+
+        self.rmax_alpha: float = rmax_alpha
+        self.spec: MixtureSpec | None = spec
+
+        self.logRmax_eff: float = 0.0  # Effective log R_max for LRT-CF
         # for ray parallelism
         cpu_count: int | None = psutil.cpu_count()
         available_cores: int = int(cpu_count) if cpu_count is not None else 1
@@ -110,8 +132,13 @@ class LDPAuditor:
         else:
             self.nb_cores = min(available_cores, n_jobs)
         
-        ray.shutdown()
-        ray.init(num_cpus=self.nb_cores)
+        if hasattr(self, "eta_val") and self.eta_val is not None:
+            ray.shutdown()  # avoid Ray init for LRT-CF
+            self.nb_cores = 1
+        else:
+            ray.shutdown()
+            ray.init(num_cpus=self.nb_cores)
+        
         self.lst_trial_per_core: list[int] = [
             len(list(_)) for _ in np.array_split(range(nb_trials), self.nb_cores)
         ]
@@ -137,6 +164,7 @@ class LDPAuditor:
             # UE protocols from pure-ldp package (version 1.1.2)
             "SUE_pure_ldp_pck": self.audit_sue_pure_ldp_pck,
             "OUE_pure_ldp_pck": self.audit_oue_pure_ldp_pck,
+            "LRT": "SPECIAL",  # 特殊扱い（run_audit 内で分岐して直に実行）
         }
 
     def set_params(self, **params) -> Self:
@@ -159,9 +187,7 @@ class LDPAuditor:
             return self
         valid_params: dict[str, Any] = self.get_params()
 
-        nested_params: defaultdict[str, dict[str, Any]] = defaultdict(
-            dict
-        )  # grouped by prefix
+        nested_params: defaultdict[str, dict[str, Any]] = defaultdict(dict)  # grouped by prefix
         for key, value in params.items():
             key, delim, sub_key = key.partition("__")
             if key not in valid_params:
@@ -198,6 +224,11 @@ class LDPAuditor:
             'k': self.k,
             'random_state': self.random_state,
             'n_jobs': self.nb_cores,
+            'eta_val': self.eta_val,
+            'eta_test': self.eta_test,
+            'spec': self.spec,
+            'rmax_alpha': self.rmax_alpha,
+            'logRmax_eff': self.logRmax_eff,
         }
 
     @ray.remote
@@ -240,6 +271,66 @@ class LDPAuditor:
         for _ in range(trials):            
             count += GRR_Client(v, k, epsilon) == test_statistic
         return count
+    
+    def _run_lrt_cf_once(self) -> float:
+        if self.eta_val is None or self.eta_test is None:
+            raise ValueError("eta_val / eta_test を set_params で渡してください。")
+
+        rng: np.random.Generator = np.random.default_rng(self.random_state)
+
+        # --- 検証 ---
+        eta_val: np.ndarray = np.asarray(self.eta_val, dtype=float)
+        n_val: int = eta_val.shape[0]
+        y_val: np.ndarray = (rng.random(n_val) < eta_val).astype(np.int64) # 正解ラベル
+        ytilde_val: np.ndarray = np.empty(n_val, dtype=np.int64)
+        for i in range(n_val):
+            ytilde_val[i] = GRR_Client(int(y_val[i]), 2, float(self.epsilon))  # ラベルRRは k=2
+
+        scores_val: np.ndarray = attack_lrt_scores(ytilde_val, eta_val, float(self.epsilon))
+        tau, _, _ = choose_tau_max_tpr_over_fpr(scores_val, y_val, clip=1e-12)
+        # ---  Effective log R_max を追加 ---
+        if self.logRmax_eff and np.isfinite(self.logRmax_eff) and self.logRmax_eff > 0:
+            # すでに外部から与えられている場合はそれを使う
+            print("Using externally provided logRmax_eff:", self.logRmax_eff)
+            pass
+        elif self.spec is not None:
+            # 解析式で ln R_max^(alpha) を計算（理論に沿う）
+            print("Computing logRmax_eff from spec:", self.spec)
+            self.logRmax_eff = float(log_Rmax_effective_gaussian(self.spec, alpha=self.rmax_alpha))
+        else:
+            e: np.ndarray = np.clip(eta_val.astype(float), 1e-6, 1 - 1e-6)
+            # 各 i において大きい方を格納
+            rmax_x: np.ndarray = np.maximum(e / (1 - e), (1 - e) / e)
+            logR: np.ndarray = np.abs(np.log(rmax_x))
+            self.logRmax_eff = float(np.quantile(logR, 0.99))
+        # --- 評価 ---
+        eta_test: np.ndarray = np.asarray(self.eta_test, dtype=float)
+        n_test: int = eta_test.shape[0]
+        y_test: np.ndarray = (rng.random(n_test) < eta_test).astype(np.int64)
+        ytilde_test: np.ndarray = np.empty(n_test, dtype=np.int64)
+        for i in range(n_test):
+            ytilde_test[i] = GRR_Client(int(y_test[i]), 2, float(self.epsilon))
+
+        scores_test: np.ndarray = attack_lrt_scores(ytilde_test, eta_test, float(self.epsilon))
+        tau = float(np.clip(tau, scores_test.min(), scores_test.max()))
+        tpr, fpr = compute_tpr_fpr(scores_test, y_test, tau)
+
+        clip = 1e-12
+        eps_emp = float(np.log(max(tpr, clip) / max(fpr, clip)))
+        self.eps_emp = eps_emp
+        print("=== LRT DEBUG ===")
+        print(f"eps={self.epsilon}, seed={self.random_state}")
+        print(f"val: n={n_val}, scores=[{scores_val.min():.4g}, {scores_val.max():.4g}]")
+        print(f"test: n={n_test}, scores=[{scores_test.min():.4g}, {scores_test.max():.4g}]")
+        print(f"tau={tau:.6g}")
+        print("y_val counts:", np.unique(y_val, return_counts=True))
+        print("y_test counts:", np.unique(y_test, return_counts=True))
+        print("ytilde_test counts:", np.unique(ytilde_test, return_counts=True))
+        print(f"tpr={tpr:.6g}, fpr={fpr:.6g}")
+        print(f"eps_emp(computed)={np.log(max(tpr,1e-12)/max(fpr,1e-12)):.6g}")
+        print("=== /LRT DEBUG ===")
+        return eps_emp
+
 
     @ray.remote
     def audit_ss(
@@ -876,7 +967,7 @@ class LDPAuditor:
         return count
     
     #================================= General Audit Method =================================
-    def run_audit(self, protocol_name):
+    def run_audit(self, protocol_name) -> float:
         """
         Runs the audit for the specified LDP protocol.
 
@@ -899,24 +990,40 @@ class LDPAuditor:
         if protocol_name not in self.protocols:
             raise ValueError(f"Unsupported protocol: {protocol_name}")
 
+        if protocol_name == "LRT":
+            # LRT は Ray 不要。確実に止める
+            try:
+                ray.shutdown()
+            except Exception:
+                pass
+            self.nb_cores = 1
+            return self._run_lrt_cf_once()
+        
+        # それ以外のプロトコルはここで Ray を準備
+        try:
+            ray.shutdown()
+        except Exception:
+            pass
+        ray.init(num_cpus=self.nb_cores)
+
         protocol = self.protocols[protocol_name]
 
         TP, FP = [], []  # initialize list for parallelized results
         for idx in range(self.nb_cores):
-            unique_seed = xxhash.xxh32(protocol_name).intdigest() + self.random_state + idx
+            unique_seed: int = xxhash.xxh32(protocol_name).intdigest() + self.random_state + idx
             TP.append(protocol.remote(self, unique_seed, self.lst_trial_per_core[idx], self.v1, self.k, self.epsilon, self.delta, self.v1))
             FP.append(protocol.remote(self, unique_seed, self.lst_trial_per_core[idx], self.v2, self.k, self.epsilon, self.delta, self.v1))
 
         # take results with get function from Ray library
-        TP = sum(ray.get(TP))
-        FP = sum(ray.get(FP))
+        TP_int: int = sum(ray.get(TP))
+        FP_int: int = sum(ray.get(FP))
 
         # Clopper-Pearson confidence intervals
-        TPR = proportion_confint(TP, self.nb_trials, self.alpha / 2, 'beta')[0]
-        FPR = proportion_confint(FP, self.nb_trials, self.alpha / 2, 'beta')[1]
+        TPR = proportion_confint(TP_int, self.nb_trials, self.alpha / 2, 'beta')[0]
+        FPR = proportion_confint(FP_int, self.nb_trials, self.alpha / 2, 'beta')[1]
 
         # empirical epsilon estimation 
-        self.eps_emp = np.log((TPR - self.delta) / FPR)
+        self.eps_emp = float(np.log((TPR - self.delta) / FPR))
 
         if self.eps_emp > self.epsilon:
             warnings.warn(f"Empirical epsilon ({self.eps_emp}) exceeds theoretical epsilon ({self.epsilon}). There might be an error in the LDP-Auditor code or the LDP protocol being audited is wrong.")
