@@ -62,7 +62,7 @@ def attack_lrt_predict(
 def choose_tau_max_tpr_over_fpr(
     scores: np.ndarray,
     y_true: np.ndarray,
-    clip: float = 1e-12,
+    alpha: float = 1e-2,
 ) -> tuple[float, float, float]:
     """
     validation の (scores, y_true) から TPR/FPR を最大化する τ* を見つける。
@@ -97,24 +97,43 @@ def choose_tau_max_tpr_over_fpr(
     fpr_all = cum_neg / N
 
     # 同じスコア値が連続している場合、それらの間では判定結果が変わらないため、スコア値が変化する地点だけ評価する
-    # unique_mask: np.ndarray = np.r_[True, s[1:] < s[:-1]]
+    unique_mask: np.ndarray = np.r_[True, s[1:] < s[:-1]]
 
-    # tpr_u: np.ndarray = tpr_all[unique_mask]
-    # fpr_u: np.ndarray = fpr_all[unique_mask]
-    # tau_u: np.ndarray = s[unique_mask]
+    tpr_u: np.ndarray = tpr_all[unique_mask]
+    fpr_u: np.ndarray = fpr_all[unique_mask]
+    tau_u: np.ndarray = s[unique_mask]
 
-    # クリップ付きの各 tau_u[i] における TPR/FPR 比（ゼロ割・無限大の暴発を抑制）
-    # ratios = (tpr_u + clip) / np.maximum(fpr_u, clip)
+    
+    mask: np.ndarray = fpr_u >= alpha
+    if not np.any(mask):
+        # FPR >= alpha を満たす tau_u が一つもない場合, Youden's J で近似
+        J = tpr_all - fpr_all
+        idx = int(np.argmax(J))
+        return float(s[idx]), float(tpr_all[idx]), float(fpr_all[idx])
 
-    J = tpr_all - fpr_all
+    ratios_masked: np.ndarray = (tpr_u[mask]) / (fpr_u[mask])
 
-    # -ratios: TPR/FPR 比の降順→その中でも FPR 昇順→その中でも TPR 降順
-    # np.lexsort は最後のキーが最も優先されるので、上記の順番で指定する
-    # タイブレーク： 同点の時にどっちを勝ちにするか決めるルール
-    # idx = int(np.lexsort((-tpr_u, fpr_u, -ratios))[-1])
-    # return float(tau_u[idx]), float(tpr_u[idx]), float(fpr_u[idx])
-    idx = np.argmax(J)
-    return float(s[idx]), float(tpr_all[idx]), float(fpr_all[idx])
+    # 1次キー: TPR/FPR 比を最大化
+    best_ratio: float = float(np.max(ratios_masked))
+    tol = 1e-12
+    cand_local: np.ndarray = np.where(np.isclose(ratios_masked, best_ratio, rtol=0, atol=tol))[0]
+
+    # 局所→全体 添字に戻す
+    idxs = np.nonzero(mask)[0]  # 全体添字の候補
+    cand_global: np.ndarray = idxs[cand_local]  # 全体添字へマッピング
+
+    # 2次キー: FPR を最小化
+    fpr_cand: np.ndarray = fpr_u[cand_global]
+    fpr_min: float = np.min(fpr_cand)
+    cand_global = cand_global[
+        np.where(np.isclose(fpr_cand, fpr_min, rtol=0, atol=tol))[0]
+    ]
+
+    # 3次キー: TPR を最大化
+    tpr_cand: np.ndarray = tpr_u[cand_global]
+    idx = int(cand_global[np.argmax(tpr_cand)])
+    return float(tau_u[idx]), float(tpr_u[idx]), float(fpr_u[idx])
+
 
 
 def compute_tpr_fpr(
