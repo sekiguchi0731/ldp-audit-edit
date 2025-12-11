@@ -3,68 +3,94 @@ import numpy as np
 from matplotlib.patches import Rectangle
 import matplotlib.pyplot as plt
 import matplotlib
-params = {'axes.titlesize':'18',
-          'xtick.labelsize':'16',
-          'ytick.labelsize':'16',
-          'font.size':'19',
-          'legend.fontsize':'medium',
-          'lines.linewidth':'2.5',
-          'font.weight':'normal',
-          'lines.markersize':'14',
-          'text.latex.preamble': r'\usepackage{amsfonts}',
-          'lines.markerfacecolor':'none'
-          }
+import math
+
+params: dict[str, str] = {'axes.titlesize':'18',
+        'xtick.labelsize':'16',
+        'ytick.labelsize':'16',
+        'font.size':'19',
+        'legend.fontsize':'medium',
+        'lines.linewidth':'2.5',
+        'font.weight':'normal',
+        'lines.markersize':'14',
+        'text.latex.preamble': r'\usepackage{amsfonts}',
+        'lines.markerfacecolor':'none'
+        }
 matplotlib.rcParams.update(params)
 plt.rcParams["mathtext.fontset"] = "cm"
 plt.rc('text', usetex=False)
 plt.rc('font', family='serif')
-markers = ['s', 'd', 'X', 'o', 'v', '*', '^', '8', 'h', '+']
+markers: list[str] = ['s', 'd', 'X', 'o', 'v', '*', '^', '8', 'h', '+', 'P', 'X', 'D']
 
 
-def plot_results_example_audit(df: pd.DataFrame, lst_protocol: list, epsilon: float, k: int):
-   
-    df_eps = df.loc[(df.epsilon == epsilon) & (df.k == k)]
-    dic_eps = df_eps.groupby('protocol')['eps_emp'].mean().to_dict()
-    dic_stds = df_eps.groupby('protocol')['eps_emp'].std().to_dict()
+def plot_results_example_audit(df: pd.DataFrame, lst_protocol: list, epsilon: float, k: int) -> None:
+    df_eps: pd.DataFrame = df.loc[(df.epsilon == epsilon) & (df.k == k)]
+    dic_eps: dict[str, float] = df_eps.groupby('protocol')['eps_emp'].mean().to_dict()
+    dic_stds: dict[str, float] = df_eps.groupby('protocol')['eps_emp'].std().to_dict()
+
+    # seed ごとに (GRR_eps + logRmax) を作ってから平均・std を取る
+    grr: pd.DataFrame = df_eps[df_eps["protocol"] == "GRR"][["seed", "eps_emp"]]
+    lr: pd.DataFrame = df_eps[["seed", "logRmax_eff"]].drop_duplicates("seed")
+    grr_plus: pd.DataFrame = grr.merge(lr, on="seed", how="inner")
+    grr_plus["sum"] = grr_plus["eps_emp"] + grr_plus["logRmax_eff"]
+    grr_plus_mean: float = float(grr_plus["sum"].mean())
+    grr_plus_std: float = float(grr_plus["sum"].std(ddof=1)) if len(grr_plus) > 1 else 0.0
+    # 表示順に 1 本追加
+    lst_protocol = lst_protocol + ["GRR +\n\\log $R_{\\max}$"]
+    dic_eps["GRR +\n\\log $R_{\\max}$"] = grr_plus_mean
+    dic_stds["GRR +\n\\log $R_{\\max}$"] = grr_plus_std
 
     # Get empirical eps
-    values = [dic_eps[key] for key in lst_protocol] 
-    stds = [dic_stds[key] for key in lst_protocol]
+    values: list[float] = [dic_eps[key] for key in lst_protocol] 
+    stds: list[float] = [dic_stds[key] for key in lst_protocol]
+
+    n: int = len(lst_protocol)
 
     # Plotting
-    plt.figure(figsize=(6, 3))
+    plt.figure(figsize=(3, 3))
     plt.grid(color='grey', linestyle='dashdot', linewidth=0.5, zorder=0)
-    plt.hlines(epsilon, -0.5, 7.5, label='Theoretical $\epsilon$', color ='red', linestyle='dashed')
+    plt.xlim(-0.5, n - 0.5)
+    plt.hlines(epsilon, -0.5, n - 0.5, label='Theoretical $\\varepsilon$', color ='red', linestyle='dashed')
     plt.bar(range(len(lst_protocol)), values, zorder=10, width=0.65)
     plt.xticks(range(len(lst_protocol)), lst_protocol, rotation = 45)
     plt.errorbar(range(len(lst_protocol)), values, yerr=stds, ecolor='black', capsize=5, zorder=50, linestyle='None')
 
-    plt.ylabel('Estimated $\epsilon_{emp}$')    
+    plt.ylabel('Estimated $\\varepsilon_{emp}$')    
     plt.xlabel('LDP Frequency Estimation Protocols')
     plt.savefig('results/fig_results_summary_audit.pdf', dpi=500, bbox_inches = 'tight',pad_inches = 0.1)
 
     return plt.show()
 
-def plot_results_pure_ldp_protocols(df: pd.DataFrame, analysis: str, lst_protocol: list, lst_eps: list, lst_k: list):
-    fig, ax = plt.subplots(4, 2, figsize=(12, 14), sharey=True)
+def plot_results_pure_ldp_protocols(df: pd.DataFrame, analysis: str, lst_protocol: list, lst_eps: list, lst_k: list, is_linear: bool) -> None:
+    # LRT 比較パネルを 1 枚追加したいので、描画用にだけ 1 要素増やす
+    add_compare_panel: bool = "LRT" in lst_protocol
+    proto_panels: list[str] = lst_protocol + (["LRT_compare"] if add_compare_panel else [])
+    
+    # 動的に行数を決定
+    ncols: int = 2
+    nrows: int = math.ceil(len(proto_panels) / ncols)
+    fig, ax = plt.subplots(nrows, ncols, figsize=(12, 3.5*nrows), sharey=True)
     plt.subplots_adjust(wspace=0.25, hspace=0.5)
 
+    # ax を常に 2 次元配列として扱う
+    ax = np.atleast_2d(ax)
+
     c = 0 # column
-    for row, protocol in enumerate(lst_protocol):
-        
-        r = row // 2
-        if c>1:
-            c=0
+    for row, protocol in enumerate(proto_panels):
+        r, c = divmod(row, ncols)
         ax[r, c].yaxis.set_tick_params(which='both', labelbottom=True)
         ax[r, c].grid(color='grey', linestyle='dashdot', linewidth=0.5)
-        ax[r, c].plot(lst_eps, label='Theoretical $\epsilon$', color ='black', linestyle='dashed')
+        ax[r, c].plot(lst_eps, label='Theoretical $\\varepsilon$', color ='black', linestyle='dashed')
+        
         mkr_idx = 0
         for k in lst_k:
-
-            results_k = []
-            variation_k = []
+            results_k: list[float] = []
+            variation_k: list[float] = []
             for epsilon in lst_eps:
                 df_eps = df.loc[(df.protocol == protocol) & (df.epsilon == epsilon) & (df.k == k)]['eps_emp'].clip(0)
+                # LRT_compare も中身は LRT を使って描く
+                proto_for_data: str = 'LRT' if protocol == 'LRT_compare' else protocol
+                df_eps: pd.Series = df.loc[(df.protocol == proto_for_data) & (df.epsilon == epsilon) & (df.k == k)]['eps_emp'].clip(0)
                 results_k.append(df_eps.mean())
                 variation_k.append(df_eps.std())
             
@@ -74,16 +100,55 @@ def plot_results_pure_ldp_protocols(df: pd.DataFrame, analysis: str, lst_protoco
             ax[r, c].plot(results_k, label = 'k={}'.format(k), marker = markers[mkr_idx])
             
             mkr_idx+=1
+            
+            # --- 比較パネルならオレンジ線（GRR + ln R_max）を重ねる ---
+            if protocol == 'LRT_compare':
+                df_grr_all: pd.DataFrame = df[df['protocol'] == 'GRR'][['seed','epsilon','eps_emp']]
+                lr_all: pd.DataFrame     = df[df['protocol']=='LRT'][['seed','logRmax_eff']].drop_duplicates('seed')
+                y_mean, y_std = [], []
+                for epsilon in lst_eps:
+                    grr_e  = df_grr_all[df_grr_all['epsilon'] == epsilon][['seed','eps_emp']]
+                    merged = grr_e.merge(lr_all, on='seed', how='inner')
+                    if merged.empty:
+                            y_mean.append(np.nan); y_std.append(np.nan)
+                    else:
+                        s = (merged['eps_emp'] + merged['logRmax_eff']).to_numpy()
+                        y_mean.append(float(np.mean(s)))
+                        y_std.append(float(np.std(s, ddof=1)) if s.size > 1 else 0.0)
+
+                x_idx = np.arange(len(lst_eps))
+                y_mean = np.array(y_mean, dtype=float)
+                y_std  = np.array(y_std, dtype=float)
+                ax[r, c].plot(x_idx, y_mean, color='tab:orange', marker='o',
+                            label='GRR +\n$\\log R_{\\max}$')
+                ax[r, c].fill_between(x_idx, y_mean - y_std, y_mean + y_std,
+                                    color='tab:orange', alpha=0.2)
         
         ax[r, c].set_yscale('log')
         ax[r, c].set_xticks(range(len(lst_eps)))
         ax[r, c].set_xticklabels(lst_eps)
         ax[r, c].set_title(protocol, fontsize=20)
-        ax[r, c].set_ylabel('Estimated $\epsilon_{emp}$')
-        ax[r, c].set_xlabel('Theoretical $\epsilon$')
-        c += 1
-        
-    ax[0, 0].legend(columnspacing=0.8, ncol=8, loc='upper center', bbox_to_anchor=(1.05, 1.5))
+        ax[r, c].set_ylabel('Estimated $\\varepsilon_{emp}$')
+        ax[r, c].set_xlabel('Theoretical $\\varepsilon$')
+
+    # 余ったパネルを非表示
+    total_panels: int = nrows * ncols
+    for j in range(len(proto_panels), total_panels):
+        r, c = divmod(j, ncols)
+        ax[r, c].set_visible(False)
+
+    # 反例
+    # ax[0, 0].legend(columnspacing=0.8, ncol=8, loc='upper center', bbox_to_anchor=(1.05, 1.5))
+    # 全パネルの凡例項目を集約して上部に表示
+    handles, labels = [], []
+    for axes in ax.flat:
+        h, l = axes.get_legend_handles_labels()
+        for hh, ll in zip(h, l):
+            if ll not in labels:  # 重複除去
+                handles.append(hh); labels.append(ll)
+    # fig.legend(handles, labels, columnspacing=0.8, ncol=8,
+    #         loc='upper center', bbox_to_anchor=(0.5, 1.01))
+    fig.legend(handles, labels, loc="lower right")
     plt.savefig('results/fig_results_'+analysis+'.pdf', dpi=500, bbox_inches = 'tight',pad_inches = 0.1)
 
     return plt.show()
@@ -240,7 +305,7 @@ def plot_results_lho_protocol(df_lho, analysis, lst_k, lst_g):
 
 
 def plot_results_longitudinal_pure_ldp_protocols(df_pure_long: pd.DataFrame, df_approx_long: pd.DataFrame, pure_ldp_protocols: list, approx_lst_protocol: list, 
-                                                 analysis: str, lst_eps: list, lst_k: list, lst_tau: list, eps_ub: float):
+                                                analysis: str, lst_eps: list, lst_k: list, lst_tau: list, eps_ub: float):
     
     df_seq = pd.concat([df_pure_long, df_approx_long], axis=0)
     lst_protocol = pure_ldp_protocols + approx_lst_protocol

@@ -63,10 +63,11 @@ def choose_tau_max_tpr_over_fpr(
     scores: np.ndarray,
     y_true: np.ndarray,
     alpha: float = 1e-2,
-) -> tuple[float, float, float]:
+    c: float = 1e-6,
+) -> float:
     """
     validation の (scores, y_true) から TPR/FPR を最大化する τ* を見つける。
-    返り値は (tau_star, tpr_at_tau_star, fpr_at_tau_star)。
+    返り値は tau_star
 
     実装メモ:
     - スコアを降順に並べ、各しきい値での (TPR, FPR) を1回の走査で計算。
@@ -78,6 +79,7 @@ def choose_tau_max_tpr_over_fpr(
     y_true = y_true.astype(np.int64, copy=False)
     if not (np.any(y_true == 0) and np.any(y_true == 1)):
         raise ValueError("y_true は 0/1 の両方を含む必要があります。")
+    c = float(max(c, 0.0))
 
     # 降順ソート
     order: np.ndarray = np.argsort(scores)[::-1]
@@ -99,50 +101,55 @@ def choose_tau_max_tpr_over_fpr(
     # 同じスコア値が連続している場合、それらの間では判定結果が変わらないため、スコア値が変化する地点だけ評価する
     unique_mask: np.ndarray = np.r_[True, s[1:] < s[:-1]]
 
-    tpr_u: np.ndarray = tpr_all[unique_mask]
-    fpr_u: np.ndarray = fpr_all[unique_mask]
-    tau_u: np.ndarray = s[unique_mask]
-
-    
-    mask: np.ndarray = fpr_u >= alpha
-    if not np.any(mask):
+    # alpha の制約は raw FPR に対して適用（c のせいで alpha を満たすことを防ぐ）
+    valid_mask: np.ndarray = unique_mask & (fpr_all >= alpha)
+    if not np.any(valid_mask):
+        print("===== WARNING: No FPR >= alpha found; using Youden's J statistic to approximate =====")
         # FPR >= alpha を満たす tau_u が一つもない場合, Youden's J で近似
-        J = tpr_all - fpr_all
+        tpr_clip = np.maximum(tpr_all, c)
+        fpr_clip = np.maximum(fpr_all, c)
+        J = tpr_clip - fpr_clip
         idx = int(np.argmax(J))
-        return float(s[idx]), float(tpr_all[idx]), float(fpr_all[idx])
+        return float(s[idx])
 
-    ratios_masked: np.ndarray = (tpr_u[mask]) / (fpr_u[mask])
+    # unique かつ FPR >= alpha を満たす候補だけを見る
+    tpr_clip: np.ndarray = np.maximum(tpr_all[valid_mask], c)
+    fpr_clip: np.ndarray = np.maximum(fpr_all[valid_mask], c)
+    tau_valid: np.ndarray = s[valid_mask]
 
-    # 1次キー: TPR/FPR 比を最大化
+    # clipped TPR/FPR array
+    ratios_masked: np.ndarray = tpr_clip / fpr_clip
+    # TPR/FPR 比を最大化する tau を選択
     best_ratio: float = float(np.max(ratios_masked))
-    tol = 1e-12
-    cand_local: np.ndarray = np.where(np.isclose(ratios_masked, best_ratio, rtol=0, atol=tol))[0]
+    cand: np.ndarray = np.where(np.isclose(ratios_masked, best_ratio, rtol=0, atol=1e-12))[0]
 
-    # 局所→全体 添字に戻す
-    idxs = np.nonzero(mask)[0]  # 全体添字の候補
-    cand_global: np.ndarray = idxs[cand_local]  # 全体添字へマッピング
-
-    # 2次キー: FPR を最小化
-    fpr_cand: np.ndarray = fpr_u[cand_global]
+    # 同点がある場合，FPR を最小化
+    fpr_cand: np.ndarray = fpr_clip[cand]
     fpr_min: float = np.min(fpr_cand)
-    cand_global = cand_global[
-        np.where(np.isclose(fpr_cand, fpr_min, rtol=0, atol=tol))[0]
-    ]
+    cand = cand[np.where(np.isclose(fpr_cand, fpr_min, rtol=0, atol=1e-12))[0]]
 
-    # 3次キー: TPR を最大化
-    tpr_cand: np.ndarray = tpr_u[cand_global]
-    idx = int(cand_global[np.argmax(tpr_cand)])
-    return float(tau_u[idx]), float(tpr_u[idx]), float(fpr_u[idx])
+    # さらに同点がある場合， TPR を最大化
+    tpr_cand: np.ndarray = tpr_clip[cand]
+    pos_in_cand = int(np.argmax(tpr_cand))         # cand の中での位置
+    global_idx = int(cand[pos_in_cand])            # tau_valid の index
+
+    # tau_valid はすでに valid_mask で絞った配列なので、これで OK
+    tau_star: float = float(tau_valid[global_idx])
+    return float(tau_star)
 
 
 
 def compute_tpr_fpr(
-    scores: np.ndarray, y_true: np.ndarray, tau: float
+    scores: np.ndarray, y_true: np.ndarray, tau: float, c: float = 1e-6, eps_floor: float = 1e-12
 ) -> tuple[float, float]:
     pos: np.ndarray = y_true == 1
     neg: np.ndarray = ~pos
-    tpr: float = float(np.mean(scores[pos] >= tau)) if np.any(pos) else 0.0
-    fpr: float = float(np.mean(scores[neg] >= tau)) if np.any(neg) else 0.0
+    tpr_raw: float = float(np.mean(scores[pos] >= tau)) if np.any(pos) else 0.0
+    fpr_raw: float = float(np.mean(scores[neg] >= tau)) if np.any(neg) else 0.0
+    # c: c-power, eps_floor: avoid zero division
+    floor: float = float(max(c, eps_floor))
+    tpr: float = max(tpr_raw, floor)
+    fpr: float = max(fpr_raw, floor)
     return tpr, fpr
 
 @jit(nopython=True)
