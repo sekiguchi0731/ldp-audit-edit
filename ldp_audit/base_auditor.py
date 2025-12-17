@@ -70,6 +70,7 @@ class LDPAuditor:
         rmax_alpha: float = 1e-6,
         spec: MixtureSpec | None = None,
         c: float = 1e-6,
+        dynamic_nb_trials: bool = True,
     ) -> None:
         """
         Initializes the LDPAuditor with the specified parameters.
@@ -111,6 +112,8 @@ class LDPAuditor:
             raise ValueError("rmax_alpha must be in (0,1)")
         if not isinstance(c, (int, float)) or c <= 0:
             raise ValueError("c must be a positive float for clipping.")
+        if not isinstance(dynamic_nb_trials, bool):
+            raise ValueError("dynamic_nb_trials must be a boolean value.")
 
         # for reproducibility
         self.random_state: int = random_state
@@ -145,8 +148,10 @@ class LDPAuditor:
         else:
             self.nb_cores = min(available_cores, n_jobs)
 
-        self.dynamic_nb_trials: int = 0
+        # dynamic に計算するか
+        self.dynamic_nb_trials: bool = True
         self._apply_dynamic_nb_trials()
+        print("Final nb_trials:", self.nb_trials)
 
         self.lst_trial_per_core: list[int] = []
         self._refresh_trial_splits()
