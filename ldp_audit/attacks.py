@@ -11,6 +11,15 @@ def _grr_pq_binary(epsilon: float) -> tuple[float, float]:
     q: float = 1.0 - p  # P( \tilde y != y | y )
     return p, q
 
+def grr_sample_binary(
+    y: int, n: int, epsilon: float, rng: np.random.Generator
+) -> np.ndarray:
+    """ rng を外部から受け取るため実装 """
+    p, q = _grr_pq_binary(float(epsilon))
+    u: np.ndarray = rng.random(n)
+    # correct with prob p, flip with prob q
+    return np.where(u < p, y, 1 - y).astype(np.int64)
+
 
 # --- 単一点の LRT 対数スコア ---
 @jit(nopython=True)
@@ -59,98 +68,37 @@ def attack_lrt_predict(
     return yhat
 
 
-def choose_tau_max_tpr_over_fpr(
-    scores: np.ndarray,
-    y_true: np.ndarray,
-    alpha: float = 1e-2,
-    c: float = 1e-6,
-) -> float:
-    """
-    validation の (scores, y_true) から TPR/FPR を最大化する τ* を見つける。
-    返り値は tau_star
-
-    実装メモ:
-    - スコアを降順に並べ、各しきい値での (TPR, FPR) を1回の走査で計算。
-    - 同一スコア値で重複計算しないよう unique 位置だけ評価。
-    - 数値不安定を避けるため FPR は clip で下駄をはかせる（ゼロ割回避）。
-    """
-    if scores.ndim != 1 or y_true.ndim != 1 or scores.size != y_true.size:
-        raise ValueError("scores と y_true は同長の1次元配列である必要があります。")
-    y_true = y_true.astype(np.int64, copy=False)
-    if not (np.any(y_true == 0) and np.any(y_true == 1)):
-        raise ValueError("y_true は 0/1 の両方を含む必要があります。")
-    c = float(max(c, 0.0))
-
-    # 降順ソート
-    order: np.ndarray = np.argsort(scores)[::-1]
-    s: np.ndarray = scores[order]
-    y: np.ndarray = y_true[order]
-
-    # 累積で TP/FP を積む（score >= tau を陽性とする規則）
-    P = float(np.sum(y == 1))
-    N = float(np.sum(y == 0))
-    # cum_pos[i]: スコア上位 i 個のうち何個が Y=1 か
-    # cum_neg[i]: スコア上位 i 個のうち何個が Y=0 か
-    cum_pos: np.ndarray = np.cumsum(y == 1).astype(np.float64)
-    cum_neg: np.ndarray = np.cumsum(y == 0).astype(np.float64)
-    # tpr_all[i] = TPR at threshold s[i]
-    # fpr_all[i] = FPR at threshold s[i]
-    tpr_all = cum_pos / P
-    fpr_all = cum_neg / N
-
-    # 同じスコア値が連続している場合、それらの間では判定結果が変わらないため、スコア値が変化する地点だけ評価する
-    unique_mask: np.ndarray = np.r_[True, s[1:] < s[:-1]]
-
-    # alpha の制約は raw FPR に対して適用（c のせいで alpha を満たすことを防ぐ）
-    valid_mask: np.ndarray = unique_mask & (fpr_all >= alpha)
-    if not np.any(valid_mask):
-        print("===== WARNING: No FPR >= alpha found; using Youden's J statistic to approximate =====")
-        # FPR >= alpha を満たす tau_u が一つもない場合, Youden's J で近似
-        tpr_clip = np.maximum(tpr_all, c)
-        fpr_clip = np.maximum(fpr_all, c)
-        J = tpr_clip - fpr_clip
-        idx = int(np.argmax(J))
-        return float(s[idx])
-
-    # unique かつ FPR >= alpha を満たす候補だけを見る
-    tpr_clip: np.ndarray = np.maximum(tpr_all[valid_mask], c)
-    fpr_clip: np.ndarray = np.maximum(fpr_all[valid_mask], c)
-    tau_valid: np.ndarray = s[valid_mask]
-
-    # clipped TPR/FPR array
-    ratios_masked: np.ndarray = tpr_clip / fpr_clip
-    # TPR/FPR 比を最大化する tau を選択
-    best_ratio: float = float(np.max(ratios_masked))
-    cand: np.ndarray = np.where(np.isclose(ratios_masked, best_ratio, rtol=0, atol=1e-12))[0]
-
-    # 同点がある場合，FPR を最小化
-    fpr_cand: np.ndarray = fpr_clip[cand]
-    fpr_min: float = np.min(fpr_cand)
-    cand = cand[np.where(np.isclose(fpr_cand, fpr_min, rtol=0, atol=1e-12))[0]]
-
-    # さらに同点がある場合， TPR を最大化
-    tpr_cand: np.ndarray = tpr_clip[cand]
-    pos_in_cand = int(np.argmax(tpr_cand))         # cand の中での位置
-    global_idx = int(cand[pos_in_cand])            # tau_valid の index
-
-    # tau_valid はすでに valid_mask で絞った配列なので、これで OK
-    tau_star: float = float(tau_valid[global_idx])
-    return float(tau_star)
-
-
-
-def compute_tpr_fpr(
-    scores: np.ndarray, y_true: np.ndarray, tau: float, c: float = 1e-6, eps_floor: float = 1e-12
+def dp_sniper_threshold_from_scores(
+    scores_yprime: np.ndarray, c: float
 ) -> tuple[float, float]:
-    pos: np.ndarray = y_true == 1
-    neg: np.ndarray = ~pos
-    tpr_raw: float = float(np.mean(scores[pos] >= tau)) if np.any(pos) else 0.0
-    fpr_raw: float = float(np.mean(scores[neg] >= tau)) if np.any(neg) else 0.0
-    # c: c-power, eps_floor: avoid zero division
-    floor: float = float(max(c, eps_floor))
-    tpr: float = max(tpr_raw, floor)
-    fpr: float = max(fpr_raw, floor)
-    return tpr, fpr
+    """
+    DP-Sniper Alg.1 line 5-8 相当:
+    y' (==1) 側サンプルのスコアから (t#, q#) を作る。
+    """
+    if scores_yprime.ndim != 1 or scores_yprime.size < 1:
+        raise ValueError("scores_yprime must be 1D non-empty.")
+    c = float(c)
+    if not (0.0 < c < 1.0):
+        raise ValueError("c must be in (0,1).")
+
+    s: np.ndarray = np.sort(scores_yprime)[::-1]  # 降順
+    N: int = s.size
+
+    # 0-indexed で ceil(cN)-1 番目（= 上位 ceil(cN) 個に入る境界）
+    k = int(np.ceil(c * N))
+    idx: int = min(max(k - 1, 0), N - 1)
+    t = float(s[idx])
+
+    # tie の数を数えて q# を作る（Alg.1 line 7）
+    atol = 1e-12
+    gt = int(np.sum(s > t + atol))                 # “明確に上”
+    eq = int(np.sum(np.abs(s - t) <= atol))        # “同点帯”
+    # q = (cN - #>t) / #=t
+    q: float = (c * N - gt) / eq if eq > 0 else 0.0
+    q = float(np.clip(q, 0.0, 1.0))
+    return t, q
+
+
 
 @jit(nopython=True)
 def attack_ss(ss):
