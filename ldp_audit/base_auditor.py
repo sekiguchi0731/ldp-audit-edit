@@ -178,6 +178,7 @@ class LDPAuditor:
             "SUE_pure_ldp_pck": self.audit_sue_pure_ldp_pck,
             "OUE_pure_ldp_pck": self.audit_oue_pure_ldp_pck,
             "LRT": "SPECIAL",  # 特殊扱い（run_audit 内で分岐して直に実行）
+            "LRT_tilde1": "SPECIAL",  # tilde y = 1 only
         }
 
     def set_params(self, **params) -> Self:
@@ -304,10 +305,11 @@ class LDPAuditor:
         term2: float = 8.0 * (1.0 - c_val) / c_val * (inv_val**2)
 
         suggested: int = int(np.ceil(max(term1, term2)))
+        print("Suggested nb_trials from dynamic adjustment:", suggested)
 
         # avoid runaway trial counts
-        max_cap: int = int(1e7)
-        suggested = int(min(max(suggested, 1), max_cap))
+        # max_cap: int = int(1e7)
+        # suggested = int(min(max(suggested, 1), max_cap))
 
         # only ever increase nb_trials automatically; userの手動設定がもっと大きければそれを優先
         self.nb_trials = max(int(self.nb_trials), suggested, 1)
@@ -407,7 +409,25 @@ class LDPAuditor:
         p: np.ndarray = 1.0 / (1.0 + np.exp(-llr))
         return p
     
-    def evaluate_eps_with_dp_sniper_cp(self, tau: float, q: float, rng: np.random.Generator) -> dict:
+    ######## tilde y=k only LRT 監査用の関数 #######
+    def _sample_score_x(self, y_input: int, n: int, rng: np.random.Generator) -> np.ndarray:
+        """
+        入力 y_input を固定して, X を n 個サンプルし，
+        score_x = logit(eta(x)) = log(eta/(1-eta)) を返す（= log r(x) と単調同値）
+        """
+        if self.spec is None:
+            raise ValueError("spec must be set.")
+        X: np.ndarray = sample_x_given_y(n=n, spec=self.spec, y=y_input, rng=rng)
+        X = self.project_l2_ball(X, B=self.B)
+
+        eta: np.ndarray = posterior_probs_from_x(X, self.spec)[:, 1]
+        eta = np.clip(eta.astype(float), 1e-15, 1.0 - 1e-15)
+
+        score_x: np.ndarray = np.log(eta) - np.log(1.0 - eta)   # logit(eta)
+        return score_x
+
+    
+    def evaluate_eps_with_dp_sniper_cp(self, tau: float, q: float, rng: np.random.Generator, is_comp_lrt: bool) -> dict:
         """
         固定した (tau,q) の攻撃 S^{tau,q} を N_final=self.nb_trials 回評価し，
         eps_emp と Clopper-Pearson による eps の上下界を返す
@@ -422,8 +442,9 @@ class LDPAuditor:
         def _sample_attack_outputs(p: np.ndarray) -> int:
             # S^{tau,q}(.) を実際にサンプルして「1 を出した回数」を返す
             atol = 1e-12
-            gt: np.ndarray = p > tau + atol
-            eq: np.ndarray = np.abs(p - tau) <= atol
+            tau_eff: float = max(float(tau), 1e-15)
+            gt: np.ndarray = p > tau_eff + atol
+            eq: np.ndarray = np.abs(p - tau_eff) <= atol
             out: np.ndarray = np.zeros(p.shape[0], dtype=np.int64)
             out[gt] = 1
             if np.any(eq):
@@ -431,11 +452,38 @@ class LDPAuditor:
             return int(out.sum())
 
         # --- TPR: y=1 を入れた時に攻撃が 1 を出す確率 ---
-        p1: np.ndarray = self._sample_p_theta(1, N_final, rng)
-        TP: int = _sample_attack_outputs(p1)
-
         # --- FPR: y=0 を入れた時に攻撃が 1 を出す確率 ---
-        p0: np.ndarray = self._sample_p_theta(0, N_final, rng)
+        if is_comp_lrt:
+            ######## 完全 LRT 監査 ########
+            p1: np.ndarray = self._sample_p_theta(1, N_final, rng)
+            p0: np.ndarray = self._sample_p_theta(0, N_final, rng)
+        else:
+            ######## tilde y=1 only LRT 監査 ########
+            # 1) X のスコア
+            score1: np.ndarray = self._sample_score_x(1, N_final, rng)
+            score0: np.ndarray = self._sample_score_x(0, N_final, rng)
+
+            # 2) tilde y を生成（入力 y を固定してGRR）
+            ytilde1: np.ndarray = grr_sample_binary(
+                y=1, n=N_final, epsilon=float(self.epsilon), rng=rng
+            )
+            ytilde0: np.ndarray = grr_sample_binary(
+                y=0, n=N_final, epsilon=float(self.epsilon), rng=rng
+            )
+
+            # 3) 「受理条件」: tilde y == 1 のときだけスコアで判定、それ以外は必ず0
+            #    dp_sniper_threshold_from_scores が「大きいほど1」前提なので score を logistic にして渡す
+            p1 = np.zeros(N_final, dtype=np.float64)
+            p0 = np.zeros(N_final, dtype=np.float64)
+
+            m1: np.ndarray = ytilde1 == 1
+            m0: np.ndarray = ytilde0 == 1
+
+            # score -> pseudo-prob (単調変換ならOK): sigmoid(score)
+            p1[m1] = 1.0 / (1.0 + np.exp(-score1[m1]))
+            p0[m0] = 1.0 / (1.0 + np.exp(-score0[m0]))
+
+        TP: int = _sample_attack_outputs(p1)
         FP: int = _sample_attack_outputs(p0)
 
         tpr_hat: float = TP / N_final
@@ -501,7 +549,7 @@ class LDPAuditor:
         
         # -------------- 評価（CP 付き eps_emp） --------------
         # c-clipping は compute_tpr_fpr 内で実装
-        results: dict = self.evaluate_eps_with_dp_sniper_cp(tau=tau, q=q, rng=rng_test)
+        results: dict = self.evaluate_eps_with_dp_sniper_cp(tau=tau, q=q, rng=rng_test, is_comp_lrt=True)
         self.eps_emp = results['eps_emp']
         eps_lo, eps_hi = results['eps_ci']
         self.eps_ci = (float(eps_lo), float(eps_hi))
@@ -515,6 +563,50 @@ class LDPAuditor:
         print(f"eps_lo={eps_lo:.6g}, eps_hi={eps_hi:.6g}")
         print("=== /LRT DEBUG ===")
         return self.eps_emp
+
+
+    ############# tilde y=1 only LRT 監査用の関数 #############
+    def _run_lrt_tilde1_once(self) -> float:
+        """
+        tilde y=1 のみ受理する攻撃者：
+        - 閾値は X-only score (=logit eta) の Y=0 側分布から dp-sniper で決める
+        - a = log(TPR_x/FPR_x) を CP で推定し、最後に + epsilon_GRR する
+        """
+        rng: np.random.Generator = np.random.default_rng(self.random_state)
+        rng_val: np.random.Generator = np.random.default_rng(rng.integers(1 << 32))
+        rng_test: np.random.Generator = np.random.default_rng(rng.integers(1 << 32))
+
+        N_sniper: int = self.nb_trials
+
+        # Y=0 側の score_x から閾値
+        scores_val: np.ndarray = self._sample_score_x(0, N_sniper, rng_val)
+        p_val = 1.0 / (1.0 + np.exp(-scores_val))          # sigmoid
+        tau, q = dp_sniper_threshold_from_scores(p_val, c=self.c)
+
+        # 数値安全：tau が 0 に落ちる事故を避ける
+        tau = float(np.clip(tau, 1e-15, 1.0 - 1e-15))
+        q = float(np.clip(q, 0.0, 1.0))
+
+        # a を評価 （X-only）
+        res_a: dict = self.evaluate_eps_with_dp_sniper_cp(tau=tau, q=q, rng=rng_test, is_comp_lrt=False)
+        a_emp: float = float(res_a["eps_emp"])
+        a_lo, a_hi = res_a["eps_ci"]
+
+        # tilde y=1 受理の“合成”に相当する分だけ +epsilon_GRR
+        eps_grr: float = float(self.epsilon)  # GRR の ε は既知
+
+        self.eps_emp = a_emp
+        self.eps_ci  = (float(a_lo), float(a_hi))
+
+        print("=== LRT_tilde1 DEBUG ===")
+        print(f"eps={self.epsilon}, seed={self.random_state}, c={self.c}")
+        print(f"tau={tau:.6g}, q={q:.6g}")
+        print(f"a_emp={a_emp:.6g}, a_lo={a_lo:.6g}, a_hi={a_hi:.6g}")
+        print(f"eps_emp=a+eps_grr={self.eps_emp:.6g}")
+        print(f"eps_ci=({self.eps_ci[0]:.6g}, {self.eps_ci[1]:.6g})")
+        print("=== /LRT_tilde1 DEBUG ===")
+
+        return float(self.eps_emp)
 
 
     @ray.remote
@@ -1183,6 +1275,14 @@ class LDPAuditor:
                 pass
             self.nb_cores = 1
             return self._run_lrt_cf_once()
+        elif protocol_name == "LRT_tilde1":
+            # tilde y=1 only LRT も Ray 不要。確実に止める
+            try:
+                ray.shutdown()
+            except Exception:
+                pass
+            self.nb_cores = 1
+            return self._run_lrt_tilde1_once()
         
         # それ以外のプロトコルはここで Ray を準備
         try:
