@@ -73,7 +73,7 @@ def dp_sniper_threshold_from_scores(
 ) -> tuple[float, float]:
     """
     DP-Sniper Alg.1 line 5-8 相当:
-    y' (==1) 側サンプルのスコアから (t#, q#) を作る。
+    y' (==0) 側サンプルのスコアから (t#, q#) を作る。
     """
     if scores_yprime.ndim != 1 or scores_yprime.size < 1:
         raise ValueError("scores_yprime must be 1D non-empty.")
