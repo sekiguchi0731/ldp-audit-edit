@@ -1,7 +1,7 @@
 # General imports
 import warnings
 from collections import defaultdict
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 import numpy as np
 import psutil
@@ -40,7 +40,7 @@ from .simulation import (
     MixtureSpec,
     log_Rmax_gaussian,
     posterior_probs_from_x,
-    sample_x_given_y,
+    sample_x_given_y_truncated,
     set_B_from_quantile,
 )
 
@@ -149,7 +149,7 @@ class LDPAuditor:
             self.nb_cores = min(available_cores, n_jobs)
 
         # dynamic に計算するか
-        self.dynamic_nb_trials: bool = True
+        self.dynamic_nb_trials: bool = dynamic_nb_trials
         self._apply_dynamic_nb_trials()
         print("Final nb_trials:", self.nb_trials)
 
@@ -179,6 +179,7 @@ class LDPAuditor:
             "OUE_pure_ldp_pck": self.audit_oue_pure_ldp_pck,
             "LRT": "SPECIAL",  # 特殊扱い（run_audit 内で分岐して直に実行）
             "LRT_tilde1": "SPECIAL",  # tilde y = 1 only
+            "LRT_indirect": "SPECIAL",  # indirect
         }
 
     def set_params(self, **params) -> Self:
@@ -398,13 +399,15 @@ class LDPAuditor:
         # y_input を固定して M(y_input) を N_final 回サンプル
         if self.spec is None:
             raise ValueError("spec must be set.")
-        X: np.ndarray = sample_x_given_y(n=n, spec=self.spec, y=y_input, rng=rng)
+        X: np.ndarray = sample_x_given_y_truncated(n=n, spec=self.spec, y=y_input, rng=rng, B=self.B)
         # 追加：L2 ボールへ投影
         X = self.project_l2_ball(X, B=self.B)
         # eta(x)=P(Y=1|X=x)
         eta: np.ndarray = posterior_probs_from_x(X, self.spec)[:, 1]
         ytilde: np.ndarray = grr_sample_binary(y=y_input, n=n, epsilon=float(self.epsilon), rng=rng)
         # llr: log-likelihood ratio
+        # sigmoid による単調変換をすることで tau と q が[0,1]に収まる
+        # これは，S={z: logLambda(z) >= tau} と S_t:={z: sigmoid(logLambda(z))=p(z) >= sigmoid(tau)} の受理集合が一致しているから
         llr: np.ndarray = attack_lrt_scores(ytilde, eta, float(self.epsilon))
         p: np.ndarray = 1.0 / (1.0 + np.exp(-llr))
         return p
@@ -417,7 +420,7 @@ class LDPAuditor:
         """
         if self.spec is None:
             raise ValueError("spec must be set.")
-        X: np.ndarray = sample_x_given_y(n=n, spec=self.spec, y=y_input, rng=rng)
+        X: np.ndarray = sample_x_given_y_truncated(n=n, spec=self.spec, y=y_input, rng=rng, B=self.B)
         X = self.project_l2_ball(X, B=self.B)
 
         eta: np.ndarray = posterior_probs_from_x(X, self.spec)[:, 1]
@@ -426,8 +429,13 @@ class LDPAuditor:
         score_x: np.ndarray = np.log(eta) - np.log(1.0 - eta)   # logit(eta)
         return score_x
 
-    
-    def evaluate_eps_with_dp_sniper_cp(self, tau: float, q: float, rng: np.random.Generator, is_comp_lrt: bool) -> dict:
+    def evaluate_eps_with_dp_sniper_cp(
+        self,
+        tau: float,
+        q: float,
+        rng: np.random.Generator,
+        attack: Literal["complete_LRT", "tilde y=1 only LRT", "indirect_LRT"],
+    ) -> dict:
         """
         固定した (tau,q) の攻撃 S^{tau,q} を N_final=self.nb_trials 回評価し，
         eps_emp と Clopper-Pearson による eps の上下界を返す
@@ -453,11 +461,11 @@ class LDPAuditor:
 
         # --- TPR: y=1 を入れた時に攻撃が 1 を出す確率 ---
         # --- FPR: y=0 を入れた時に攻撃が 1 を出す確率 ---
-        if is_comp_lrt:
+        if attack == "complete_LRT":
             ######## 完全 LRT 監査 ########
             p1: np.ndarray = self._sample_p_theta(1, N_final, rng)
             p0: np.ndarray = self._sample_p_theta(0, N_final, rng)
-        else:
+        elif attack == "tilde y=1 only LRT":
             ######## tilde y=1 only LRT 監査 ########
             # 1) X のスコア
             score1: np.ndarray = self._sample_score_x(1, N_final, rng)
@@ -482,6 +490,17 @@ class LDPAuditor:
             # score -> pseudo-prob (単調変換ならOK): sigmoid(score)
             p1[m1] = 1.0 / (1.0 + np.exp(-score1[m1]))
             p0[m0] = 1.0 / (1.0 + np.exp(-score0[m0]))
+        elif attack == "indirect_LRT":
+            ######## 間接 LRT 監査 ########
+            # 1) X のスコア: logit(eta(x))
+            p1: np.ndarray = self._sample_score_x(1, N_final, rng)
+            p0: np.ndarray = self._sample_score_x(0, N_final, rng)
+
+            p1 = 1.0 / (1.0 + np.exp(-p1))  # sigmoid(score)
+            p0 = 1.0 / (1.0 + np.exp(-p0))  # sigmoid(score)
+        else:
+            raise ValueError("Unknown attack type for LRT-CF evaluation.")
+
 
         TP: int = _sample_attack_outputs(p1)
         FP: int = _sample_attack_outputs(p0)
@@ -549,7 +568,7 @@ class LDPAuditor:
         
         # -------------- 評価（CP 付き eps_emp） --------------
         # c-clipping は compute_tpr_fpr 内で実装
-        results: dict = self.evaluate_eps_with_dp_sniper_cp(tau=tau, q=q, rng=rng_test, is_comp_lrt=True)
+        results: dict = self.evaluate_eps_with_dp_sniper_cp(tau=tau, q=q, rng=rng_test, attack="complete_LRT")
         self.eps_emp = results['eps_emp']
         eps_lo, eps_hi = results['eps_ci']
         self.eps_ci = (float(eps_lo), float(eps_hi))
@@ -588,7 +607,7 @@ class LDPAuditor:
         q = float(np.clip(q, 0.0, 1.0))
 
         # a を評価 （X-only）
-        res_a: dict = self.evaluate_eps_with_dp_sniper_cp(tau=tau, q=q, rng=rng_test, is_comp_lrt=False)
+        res_a: dict = self.evaluate_eps_with_dp_sniper_cp(tau=tau, q=q, rng=rng_test, attack="indirect_LRT")
         a_emp: float = float(res_a["eps_emp"])
         a_lo, a_hi = res_a["eps_ci"]
 
@@ -605,6 +624,47 @@ class LDPAuditor:
         print(f"eps_emp=a+eps_grr={self.eps_emp:.6g}")
         print(f"eps_ci=({self.eps_ci[0]:.6g}, {self.eps_ci[1]:.6g})")
         print("=== /LRT_tilde1 DEBUG ===")
+
+        return float(self.eps_emp)
+
+    ############# indirect LRT 監査用の関数 #############
+    def _run_lrt_indirect_once(self) -> float:
+        """
+        攻撃者：
+        - 閾値は X-only score (=logit eta) の Y=0 側分布から dp-sniper で決める
+        - a = log(TPR_x/FPR_x) を CP で推定し、最後に + epsilon_GRR する
+        """
+        rng: np.random.Generator = np.random.default_rng(self.random_state)
+        rng_val: np.random.Generator = np.random.default_rng(rng.integers(1 << 32))
+        rng_test: np.random.Generator = np.random.default_rng(rng.integers(1 << 32))
+
+        N_sniper: int = self.nb_trials
+
+        # Y=0 側の score_x から閾値
+        scores_val: np.ndarray = self._sample_score_x(0, N_sniper, rng_val)
+        p_val = 1.0 / (1.0 + np.exp(-scores_val))          # sigmoid
+        tau, q = dp_sniper_threshold_from_scores(p_val, c=self.c)
+
+        # a を評価 （X-only）
+        res_a: dict = self.evaluate_eps_with_dp_sniper_cp(
+            tau=tau, q=q, rng=rng_test, attack="indirect_LRT"
+        )
+        a_emp : float = float(res_a["eps_emp"])
+        a_lo, a_hi = res_a["eps_ci"]
+
+        # tilde y=1 受理の“合成”に相当する分だけ +epsilon_GRR
+        eps_grr: float = float(self.epsilon)  # GRR の ε は既知
+
+        self.eps_emp = a_emp + eps_grr
+        self.eps_ci = (float(a_lo + eps_grr), float(a_hi + eps_grr))
+
+        print("=== indirect LRT DEBUG ===")
+        print(f"eps={self.epsilon}, seed={self.random_state}, c={self.c}")
+        print(f"tau={tau:.6g}, q={q:.6g}")
+        print(f"a_lo={a_lo:.6g}, a_hi={a_hi:.6g}")
+        print(f"eps_emp=a+eps_grr={self.eps_emp:.6g}")
+        print(f"eps_ci=({self.eps_ci[0]:.6g}, {self.eps_ci[1]:.6g})")
+        print("=== /indirect LRT DEBUG ===")
 
         return float(self.eps_emp)
 
@@ -1283,6 +1343,14 @@ class LDPAuditor:
                 pass
             self.nb_cores = 1
             return self._run_lrt_tilde1_once()
+        elif protocol_name == "LRT_indirect":
+            # indirect LRT も Ray 不要。確実に止める
+            try:
+                ray.shutdown()
+            except Exception:
+                pass
+            self.nb_cores = 1
+            return self._run_lrt_indirect_once()
         
         # それ以外のプロトコルはここで Ray を準備
         try:
@@ -1334,7 +1402,7 @@ class LDPAuditor:
 
 # print('\n=====Auditing approximate LDP protocols=====')
 # delta = 1e-5
-# approx_ldp_protocols = ['AGRR', 'ASUE', 'AGM', 'GM', 'ABLH', 'AOLH']
+# approx_ldp_protocols = ['AGRR', 'ASUE', 'AGM', 'GM', 'ABLH', 'pAOLH']
 # auditor_approx_ldp = LDP_Auditor(nb_trials=nb_trials, alpha=alpha, epsilon=epsilon, delta=delta, k=k, random_state=seed, n_jobs=-1)
 
 # for protocol in approx_ldp_protocols:
