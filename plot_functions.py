@@ -6,6 +6,8 @@ import matplotlib
 import math
 import argparse
 from pathlib import Path
+from scipy.special import erfinv
+from typing import Literal
 
 params: dict[str, str] = {'axes.titlesize':'18',
         'xtick.labelsize':'16',
@@ -163,7 +165,7 @@ def plot_results_pure_ldp_protocols(df: pd.DataFrame, analysis: str, lst_protoco
                 y_mean = np.array(y_mean, dtype=float)
                 y_std  = np.array(y_std, dtype=float)
                 ax[r, c].plot(x_idx, y_mean, color='tab:orange', marker='o',
-                            label='GRR +\n$\\log R_{\\max}$')
+                            label='RR +\n$\\log R_{\\max}$')
                 ax[r, c].fill_between(x_idx, y_mean - y_std, y_mean + y_std,
                                     color='tab:orange', alpha=0.2)
             
@@ -323,6 +325,284 @@ def plot_results_pure_ldp_protocols(df: pd.DataFrame, analysis: str, lst_protoco
     return plt.show()
 
 
+def guideline1_suggested_N(
+    c: float, alpha: float, omega: float = 0.005, beta: float | None = None
+) -> int:
+    c_val = float(np.clip(c, 1e-12, 1 - 1e-12))
+    beta_val = float(alpha if beta is None else beta)
+    beta_val: float = min(max(beta_val, 1e-6), 0.49)
+
+    base1: float = 2.0 * (1.0 - c_val) / (omega**2 * c_val)
+    base2: float = 8.0 * (1.0 - c_val) / c_val
+    erf_arg = float(np.clip(1.0 - 2.0 * beta_val, -0.999999, 0.999999))
+    erf_sq: float = float(erfinv(erf_arg)) ** 2
+
+    return int(np.ceil(max(base1, base2) * erf_sq))
+
+
+def guideline1_c_boundary_for_fixed_N(
+    *, N_fixed: int, alpha: float, omega: float, beta: float | None = None
+) -> float:
+    """
+    Guideline1: N >= max(2(1-c)/(omega^2 c), 8(1-c)/c) * (erf^{-1}(1-2beta))^2
+    を満たす境界 c* を返す。
+    A = max(2/omega^2, 8), E = (erf^{-1}(1-2beta))^2
+    => c* = (A*E) / (N + A*E)
+    """
+    if N_fixed <= 0:
+        raise ValueError("N_fixed must be positive.")
+
+    beta_val = float(alpha if beta is None else beta)
+    beta_val: float = min(max(beta_val, 1e-6), 0.49)
+
+    A1: float = 2.0 / (float(omega) ** 2)
+    inv_val = float(erfinv(float(np.clip(1.0 - 2.0 * beta_val, -0.999999, 0.999999))))
+    A2 = 8.0
+    A: float = max(A1, A2)
+    E: float = inv_val**2
+
+    c_star = float((A * E) / (float(N_fixed) + (A * E)))
+    # safety clip
+    return float(np.clip(c_star, 1e-12, 1.0 - 1e-12))
+
+
+def plot_sweep_gap_from_upper_with_errorbars(
+    df: pd.DataFrame,
+    *,
+    is_N: bool = True,  # True: x=N, False: x=c
+    epsilon_theoretical: float = 1.0,
+    k: int = 2,
+    # guideline line for N-sweep
+    c_for_guideline: float = 1e-2,
+    alpha: float = 1e-2,
+    omega: float = 0.005,
+    shift_list: list[float] | None = None,
+    outpath: str = "results/fig_sweep_gap_from_upper.pdf",
+) -> None:
+    """
+    y-axis: (GRR + logRmax_eff) - estimate   (mean ± 1σ over seeds)
+
+    LRT (default color):
+      - ○ solid : upper - eps_emp
+      - ▽ dotted: upper - eps_lower
+      - △ dotted: upper - eps_upper
+
+    LRT_decomp (tab:purple)  [data protocol name is still "LRT_indirect"]:
+      - ▽ solid : upper - eps_lower
+      - △ dotted: upper - eps_upper
+
+    If is_N:
+      x-axis = N (log scale) + vertical guideline line at N_guideline(c_for_guideline)
+    else (c-sweep):
+      x-axis = c (log scale) + vertical boundary line c* such that Guideline1(N>=...) is satisfied for fixed N
+    """
+    xcol: Literal['N'] | Literal['c'] = "N" if is_N else "c"
+
+    # --- filter fixed params ---
+    df0: pd.DataFrame = df.copy()
+    df0 = df0[df0["k"] == k]
+    df0 = df0[np.isclose(df0["epsilon"].astype(float), float(epsilon_theoretical))]
+
+    if shift_list is None:
+        shift_list = sorted(df0["mean_shift"].dropna().unique().tolist())
+
+    # --- Guideline lines ---
+    N_guideline: int | None = None
+    c_boundary: float | None = None
+
+    if is_N:
+        # N-sweep: existing guideline (vertical line at N_guideline for given c)
+        # (you already have guideline1_suggested_N; keep using it)
+        N_guideline = guideline1_suggested_N(
+            c=c_for_guideline, alpha=alpha, omega=omega, beta=alpha
+        )
+    else:
+        # c-sweep: infer fixed N from df
+        N_vals: list[int] = sorted(set(int(v) for v in df0["N"].dropna().unique().tolist()))
+        if len(N_vals) != 1:
+            raise ValueError(f"c-sweep expects fixed N, but got N values: {N_vals}")
+        N_fixed: int = N_vals[0]
+        c_boundary = guideline1_c_boundary_for_fixed_N(
+            N_fixed=N_fixed, alpha=alpha, omega=omega, beta=alpha
+        )
+
+    # --- build upper = GRR + logRmax_eff (per seed, per (shift,x)) ---
+    grr: pd.DataFrame = df0[df0["protocol"] == "GRR"][["mean_shift", xcol, "seed", "eps_emp"]].copy()
+    lr: pd.DataFrame = (
+        df0[["mean_shift", xcol, "seed", "logRmax_eff"]]
+        .drop_duplicates(["mean_shift", xcol, "seed"])
+        .copy()
+    )
+
+    upper: pd.DataFrame = grr.merge(lr, on=["mean_shift", xcol, "seed"], how="inner")
+    upper["upper"] = upper["eps_emp"].astype(float) + upper["logRmax_eff"].astype(float)
+    upper = upper[["mean_shift", xcol, "seed", "upper"]]
+
+    # --- helper: aggregate gap mean/std over seeds ---
+    def agg_gap(df_gap: pd.DataFrame, label: str) -> pd.DataFrame:
+        g: pd.DataFrame = df_gap.groupby(["mean_shift", xcol], as_index=False).agg(
+            mean=("gap", "mean"),
+            std=("gap", lambda x: float(np.std(x, ddof=1)) if len(x) > 1 else 0.0),
+        )
+        g["series"] = label
+        return g
+
+    # ===== LRT =====
+    lrt: pd.DataFrame = df0[df0["protocol"] == "LRT"][
+        ["mean_shift", xcol, "seed", "eps_emp", "eps_lower", "eps_upper"]
+    ].copy()
+    lrt = lrt.merge(upper, on=["mean_shift", xcol, "seed"], how="inner")
+
+    lrt_emp: pd.DataFrame = lrt.copy()
+    lrt_emp["gap"] = lrt_emp["upper"] - lrt_emp["eps_emp"]
+    g_lrt_emp: pd.DataFrame = agg_gap(lrt_emp, "LRT_emp")
+
+    lrt_lo: pd.DataFrame = lrt.dropna(subset=["eps_lower"]).copy()
+    lrt_lo["gap"] = lrt_lo["upper"] - lrt_lo["eps_lower"]
+    g_lrt_lo: pd.DataFrame = agg_gap(lrt_lo, "LRT_lower")
+
+    lrt_hi: pd.DataFrame = lrt.dropna(subset=["eps_upper"]).copy()
+    lrt_hi["gap"] = lrt_hi["upper"] - lrt_hi["eps_upper"]
+    g_lrt_hi: pd.DataFrame = agg_gap(lrt_hi, "LRT_upper")
+
+    # ===== LRT_decomp (data protocol name is "LRT_indirect") =====
+    ind: pd.DataFrame = df0[df0["protocol"] == "LRT_indirect"][
+        ["mean_shift", xcol, "seed", "eps_lower", "eps_upper"]
+    ].copy()
+    ind = ind.merge(upper, on=["mean_shift", xcol, "seed"], how="inner")
+
+    ind_lo: pd.DataFrame = ind.dropna(subset=["eps_lower"]).copy()
+    ind_lo["gap"] = ind_lo["upper"] - ind_lo["eps_lower"]
+    g_ind_lo: pd.DataFrame = agg_gap(ind_lo, "DECOMP_lower")
+
+    ind_hi: pd.DataFrame = ind.dropna(subset=["eps_upper"]).copy()
+    ind_hi["gap"] = ind_hi["upper"] - ind_hi["eps_upper"]
+    g_ind_hi: pd.DataFrame = agg_gap(ind_hi, "DECOMP_upper")
+
+    agg: pd.DataFrame = pd.concat(
+        [g_lrt_emp, g_lrt_lo, g_lrt_hi, g_ind_lo, g_ind_hi], ignore_index=True
+    )
+
+    # --- plotting ---
+    fig, axes = plt.subplots(
+        1, len(shift_list), figsize=(5.2 * len(shift_list), 3.8), sharey=True
+    )
+    if len(shift_list) == 1:
+        axes: list = [axes]
+
+    for ax, shift in zip(axes, shift_list):
+        sub: pd.DataFrame = agg[np.isclose(agg["mean_shift"], float(shift))].copy().sort_values(xcol)
+
+        ax.axhline(0.0, linestyle="--", linewidth=1.0)
+
+        if is_N and N_guideline is not None:
+            ax.axvline(float(N_guideline), linestyle="--", linewidth=1.0)
+        if (not is_N) and (c_boundary is not None):
+            ax.axvline(float(c_boundary), linestyle="--", linewidth=1.0)
+
+        ax.grid(True, linestyle="dashdot", linewidth=0.5)
+
+        # --- LRT (default color) ---
+        s: pd.DataFrame = sub[sub["series"] == "LRT_emp"]
+        ln: list = ax.plot(
+            s[xcol], s["mean"], marker="o", linestyle="-", label=r"LRT: Upper - eps$_\mathrm{emp}"
+        )
+        c_lrt: str = ln[0].get_color()
+        ax.errorbar(
+            s[xcol], s["mean"], yerr=s["std"], linestyle="None", capsize=3, color=c_lrt
+        )
+
+        for lab, mkr in [("LRT_lower", "v"), ("LRT_upper", "^")]:
+            s2: pd.DataFrame = sub[sub["series"] == lab]
+            ax.plot(
+                s2[xcol],
+                s2["mean"],
+                linestyle=":",
+                marker=mkr,
+                color=c_lrt,
+                label=r"LRT: Upper - eps$_\mathrm{lower}$" if mkr == "v" else r"LRT: Upper - eps$_\mathrm{upper}$",
+            )
+            ax.errorbar(
+                s2[xcol],
+                s2["mean"],
+                yerr=s2["std"],
+                linestyle="None",
+                capsize=3,
+                color=c_lrt,
+            )
+
+        # --- LRT_decomp (purple) ---
+        base = "tab:purple"
+        s3: pd.DataFrame = sub[sub["series"] == "DECOMP_lower"]
+        ax.plot(
+            s3[xcol],
+            s3["mean"],
+            linestyle="-",
+            marker="v",
+            color=base,
+            linewidth=2.5,
+            label="LRT_decomp: upper - eps_lower",
+        )
+        ax.errorbar(
+            s3[xcol],
+            s3["mean"],
+            yerr=s3["std"],
+            linestyle="None",
+            capsize=3,
+            color=base,
+        )
+
+        s4: pd.DataFrame = sub[sub["series"] == "DECOMP_upper"]
+        ax.plot(
+            s4[xcol],
+            s4["mean"],
+            linestyle=":",
+            marker="^",
+            color=base,
+            label="LRT_decomp: upper - eps_upper",
+        )
+        ax.errorbar(
+            s4[xcol],
+            s4["mean"],
+            yerr=s4["std"],
+            linestyle="None",
+            capsize=3,
+            color=base,
+        )
+
+        ax.set_xscale("log")
+        ax.set_xlabel("N (nb_trials)" if is_N else "c")
+        ax.set_title(f"mean_shift = {shift}")
+
+        # --- annotate boundary meaning (optional but helpful) ---
+        if (not is_N) and (c_boundary is not None):
+            # text near top
+            y_top: float = ax.get_ylim()[1]
+            ax.text(
+                float(c_boundary),
+                y_top,
+                "",
+                ha="left",
+                va="top",
+            )
+
+    axes[0].set_ylabel("estimate error")
+
+    # legend: avoid overlap
+    handles, labels = axes[-1].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        ncol=2,
+        bbox_to_anchor=(0.5, 1.05),
+        frameon=True,
+    )
+    fig.tight_layout(rect=(0.04, 0.0, 1.0, 0.80))
+
+    plt.savefig(outpath, dpi=300, bbox_inches="tight", pad_inches=0.1)
+    plt.show()
+
 def plot_results_approx_ldp_protocols(df: pd.DataFrame, analysis: str, lst_protocol: list, lst_eps: list, lst_k: list):
 
     fig, ax = plt.subplots(3, 2, figsize=(12, 10.5), sharey=True)
@@ -332,7 +612,7 @@ def plot_results_approx_ldp_protocols(df: pd.DataFrame, analysis: str, lst_proto
     c = 0 # column
     for row, protocol in enumerate(lst_protocol):
         
-        r = row // 2
+        r: int = row // 2
         if c>1:
             c=0
         ax[r, c].yaxis.set_tick_params(which='both', labelbottom=True)
@@ -747,66 +1027,138 @@ def plot_lrt_compare_2x2(
     ax = np.atleast_2d(ax)
 
     for idx, (df, title) in enumerate(zip(dfs, panel_titles)):
-        r, c = divmod(idx, 2)
-        a = ax[r, c]
+        r, ccol = divmod(idx, 2)
+        a = ax[r, ccol]
         a.grid(color="grey", linestyle="dashdot", linewidth=0.5)
 
         # x 軸（epsilon のユニーク値）
         eps_list = np.sort(df["epsilon"].dropna().unique().astype(float))
         x = np.arange(len(eps_list), dtype=int)
+        m = {float(e): i for i, e in enumerate(eps_list)}
 
-        # 理論 y = epsilon
+        # --- theoretical y = epsilon ---
         a.plot(
             x,
             eps_list,
             linestyle="dashed",
             color="black",
             label="Theoretical $\\varepsilon$",
+            zorder=1,
         )
 
-        # LRT eps_emp mean±std
-        eps_lrt, lrt_mean, lrt_std = _series_mean_std(df, "LRT", k, "eps_emp")
-        if eps_lrt.size > 0:
-            # eps_list の順に合わせる
-            m: dict[float, int] = {float(e): i for i, e in enumerate(eps_list)}
-            xi: np.ndarray = np.array([m[float(e)] for e in eps_lrt], dtype=int)
-            a.plot(xi, lrt_mean, marker="s", label="LRT ($\\hat\\varepsilon_{emp}$)")
-            a.fill_between(xi, lrt_mean - lrt_std, lrt_mean + lrt_std, alpha=0.25)
+        # =========================
+        # LRT（完全）: lower=実線, upper=点線
+        # =========================
+        eps_lo, lo_mean, _ = _series_mean_std(df, "LRT", k, "eps_lower")
+        eps_hi, hi_mean, _ = _series_mean_std(df, "LRT", k, "eps_upper")
 
-        # LRT lower/upper (mean)
-        if "eps_lower" in df.columns and "eps_upper" in df.columns:
-            eps_lo, lo_mean, _ = _series_mean_std(df, "LRT", k, "eps_lower")
-            eps_hi, hi_mean, _ = _series_mean_std(df, "LRT", k, "eps_upper")
-            if eps_lo.size > 0 and eps_hi.size > 0:
-                m = {float(e): i for i, e in enumerate(eps_list)}
-                xlo: np.ndarray = np.array([m[float(e)] for e in eps_lo], dtype=int)
-                xhi: np.ndarray = np.array([m[float(e)] for e in eps_hi], dtype=int)
-                # 同色にしたいので直前の線色を取る（無ければ黒）
-                line_color: str = a.lines[-1].get_color() if len(a.lines) > 0 else "black"
-                a.plot(
-                    xlo,
-                    lo_mean,
-                    linestyle=":",
-                    marker="v",
-                    color=line_color,
-                    label="LRT (lower)",
-                )
-                a.plot(
-                    xhi,
-                    hi_mean,
-                    linestyle=":",
-                    marker="^",
-                    color=line_color,
-                    label="LRT (upper)",
-                )
+        line_color = None
+        if eps_lo.size > 0:
+            xlo = np.array([m[float(e)] for e in eps_lo], dtype=int)
+            ln = a.plot(
+                xlo,
+                lo_mean,
+                marker="s",
+                linestyle="-",
+                label="LRT (lower)",
+                zorder=10,
+            )
+            line_color = ln[0].get_color()
+        else:
+            line_color = "tab:blue"
 
-        # GRR + logRmax mean±std
-        eps_g, g_mean, g_std = _grr_plus_logrmax_mean_std(df, k)
-        if eps_g.size > 0:
-            m = {float(e): i for i, e in enumerate(eps_list)}
-            xg: np.ndarray = np.array([m[float(e)] for e in eps_g], dtype=int)
-            a.plot(xg, g_mean, marker="o", label="GRR + $\\log R_{\\max}$")
-            a.fill_between(xg, g_mean - g_std, g_mean + g_std, alpha=0.20)
+        if eps_hi.size > 0:
+            xhi = np.array([m[float(e)] for e in eps_hi], dtype=int)
+            a.plot(
+                xhi,
+                hi_mean,
+                linestyle=":",
+                marker="^",
+                color=line_color,
+                label="LRT (upper)",
+                zorder=11,
+            )
+
+        # =========================
+        # LRT_indirect（分離監査 = LRT-Decomp）
+        #   lower=実線(太め), upper=点線
+        # =========================
+        base_color = "tab:purple"
+
+        eps_lo_d, d_lo_mean, _ = _series_mean_std(df, "LRT_indirect", k, "eps_lower")
+        if eps_lo_d.size > 0:
+            xlo = np.array([m[float(e)] for e in eps_lo_d], dtype=int)
+            a.plot(
+                xlo,
+                d_lo_mean,
+                color=base_color,
+                linestyle="-",
+                linewidth=2.5,
+                marker="v",
+                label="LRT_decomp (lower)",
+                zorder=21,
+            )
+
+        eps_hi_d, d_hi_mean, _ = _series_mean_std(df, "LRT_indirect", k, "eps_upper")
+        if eps_hi_d.size > 0:
+            xhi = np.array([m[float(e)] for e in eps_hi_d], dtype=int)
+            a.plot(
+                xhi,
+                d_hi_mean,
+                color=base_color,
+                linestyle=":",
+                marker="^",
+                label="LRT_decomp (upper)",
+                zorder=21,
+            )
+
+        # =========================
+        # GRR + logRmax（オレンジ）: 最前面
+        # =========================
+        df_k = df.loc[df["k"] == k].copy()
+
+        df_grr_all = df_k.loc[
+            df_k["protocol"] == "GRR", ["seed", "epsilon", "eps_emp"]
+        ].dropna()
+
+        lr_all = df_k.loc[:, ["seed", "logRmax_eff"]].dropna().drop_duplicates("seed")
+
+        if not df_grr_all.empty and not lr_all.empty:
+            y_mean, y_std = [], []
+            for eps in eps_list:
+                grr_e = df_grr_all.loc[
+                    df_grr_all["epsilon"] == eps, ["seed", "eps_emp"]
+                ]
+                merged = grr_e.merge(lr_all, on="seed", how="inner")
+                if merged.empty:
+                    y_mean.append(np.nan)
+                    y_std.append(np.nan)
+                else:
+                    s = (merged["eps_emp"] + merged["logRmax_eff"]).to_numpy(
+                        dtype=float
+                    )
+                    y_mean.append(float(np.mean(s)))
+                    y_std.append(float(np.std(s, ddof=1)) if s.size > 1 else 0.0)
+
+            y_mean = np.array(y_mean, dtype=float)
+            y_std = np.array(y_std, dtype=float)
+
+            a.plot(
+                x,
+                y_mean,
+                color="tab:orange",
+                marker="o",
+                label="RR + $\\log R_{\\max}$",
+                zorder=100,
+            )
+            a.fill_between(
+                x,
+                y_mean - y_std,
+                y_mean + y_std,
+                color="tab:orange",
+                alpha=0.20,
+                zorder=90,
+            )
 
         if yscale == "log":
             a.set_yscale("log")
@@ -814,13 +1166,14 @@ def plot_lrt_compare_2x2(
         a.set_title(title, fontsize=25)
         a.set_xticks(x)
         a.set_xticklabels([str(e) for e in eps_list])
+
         if r == 1:
             a.set_xlabel("Theoretical $\\varepsilon$", fontsize=25)
         else:
             a.set_xlabel("")
             a.tick_params(axis="x", labelbottom=False)
-        if c == 0:
-            a.set_ylabel("Estimated $\\varepsilon_{emp}$", fontsize=25)
+        if ccol == 0:
+            a.set_ylabel("Estimated $\\varepsilon$ (CI)", fontsize=25)
 
     # 図全体の凡例（重複除去）
     handles, labels = [], []
@@ -830,7 +1183,22 @@ def plot_lrt_compare_2x2(
             if ll not in labels:
                 handles.append(hh)
                 labels.append(ll)
-    fig.legend(handles, labels, loc="lower right")
+
+    ncol = 3
+    plt.subplots_adjust(top=0.82)
+
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.02),
+        ncol=ncol,
+        frameon=True,
+        columnspacing=0.9,
+        handletextpad=0.6,
+        fontsize=20,
+        borderaxespad=0.2,
+    )
 
     outpath = str(outpath)
     Path(outpath).parent.mkdir(parents=True, exist_ok=True)
@@ -1031,13 +1399,272 @@ def plot_results_example_audit_2x2(
     plt.savefig(outpath, dpi=500, bbox_inches="tight", pad_inches=0.1)
     plt.show()
 
+def _plot_sweep_gap_panel(
+    ax: plt.Axes,  # type: ignore
+    df: pd.DataFrame,
+    *,
+    is_N: bool,
+    mean_shift: float,
+    epsilon_theoretical: float,
+    k: int,
+    c_for_guideline: float,
+    alpha: float,
+    omega: float,
+    fixed_value: float | None = None,
+    fixed_label: str | None = None, 
+) -> tuple[list, list]:
+    # TODO: fixed 値のパラメータを引数化する
+    xcol: Literal['N'] | Literal['c'] = "N" if is_N else "c"
+
+    # --- filter fixed params + mean_shift ---
+    df0: pd.DataFrame = df.copy()
+    df0 = df0[df0["k"] == k]
+    df0 = df0[np.isclose(df0["epsilon"].astype(float), float(epsilon_theoretical))]
+    df0 = df0[np.isclose(df0["mean_shift"].astype(float), float(mean_shift))]
+
+    # --- infer fixed value if not given  ---
+    if fixed_value is None:
+        if is_N:
+            # N-sweep → c が固定
+            if "c" in df0.columns:
+                c_vals = sorted(df0["c"].dropna().unique())
+                if len(c_vals) == 1:
+                    fixed_value = float(c_vals[0])
+                    fixed_label = "c"
+        else:
+            # c-sweep → N が固定
+            if "N" in df0.columns:
+                N_vals = sorted(df0["N"].dropna().unique())
+                if len(N_vals) == 1:
+                    fixed_value = float(N_vals[0])
+                    fixed_label = "N"
+
+    # --- Guideline vertical line (orange) ---
+    N_guideline: int | None = None
+    c_boundary = None
+    if is_N:
+        N_guideline = guideline1_suggested_N(
+            c=c_for_guideline, alpha=alpha, omega=omega, beta=alpha
+        )
+    else:
+        N_vals: list[int] = sorted(set(int(v) for v in df0["N"].dropna().unique().tolist()))
+        if len(N_vals) != 1:
+            raise ValueError(f"c-sweep expects fixed N, but got N values: {N_vals}")
+        c_boundary = guideline1_c_boundary_for_fixed_N(
+            N_fixed=N_vals[0], alpha=alpha, omega=omega, beta=alpha
+        )
+
+    # --- build upper ---
+    grr: pd.DataFrame = df0[df0["protocol"] == "GRR"][["seed", xcol, "eps_emp"]].copy()
+    lr: pd.DataFrame = df0[["seed", xcol, "logRmax_eff"]].drop_duplicates(["seed", xcol]).copy()
+
+    upper: pd.DataFrame = grr.merge(lr, on=["seed", xcol], how="inner")
+    upper["upper"] = upper["eps_emp"] + upper["logRmax_eff"]
+    upper = upper[["seed", xcol, "upper"]]
+
+    def _agg_gap(df_gap: pd.DataFrame, label: str) -> pd.DataFrame:
+        g: pd.DataFrame = df_gap.groupby([xcol], as_index=False).agg(
+            mean=("gap", "mean"),
+            std=("gap", lambda x: float(np.std(x, ddof=1)) if len(x) > 1 else 0.0),
+        )
+        g["series"] = label
+        return g
+
+    # ===== LRT (完全) =====
+    lrt: pd.DataFrame = df0[df0["protocol"] == "LRT"][["seed", xcol, "eps_lower", "eps_upper"]].copy()
+    lrt = lrt.merge(upper, on=["seed", xcol], how="inner")
+
+    lrt_lo = lrt.dropna(subset=["eps_lower"]).copy()
+    lrt_lo["gap"] = lrt_lo["upper"] - lrt_lo["eps_lower"]
+    g_lrt_lo = _agg_gap(lrt_lo, "LRT_lower")
+
+    lrt_hi = lrt.dropna(subset=["eps_upper"]).copy()
+    lrt_hi["gap"] = lrt_hi["upper"] - lrt_hi["eps_upper"]
+    g_lrt_hi = _agg_gap(lrt_hi, "LRT_upper")
+
+    # ===== LRT_decomp =====
+    ind = df0[df0["protocol"] == "LRT_indirect"][
+        ["seed", xcol, "eps_lower", "eps_upper"]
+    ].copy()
+    ind = ind.merge(upper, on=["seed", xcol], how="inner")
+
+    ind_lo = ind.dropna(subset=["eps_lower"]).copy()
+    ind_lo["gap"] = ind_lo["upper"] - ind_lo["eps_lower"]
+    g_ind_lo = _agg_gap(ind_lo, "DECOMP_lower")
+
+    ind_hi = ind.dropna(subset=["eps_upper"]).copy()
+    ind_hi["gap"] = ind_hi["upper"] - ind_hi["eps_upper"]
+    g_ind_hi = _agg_gap(ind_hi, "DECOMP_upper")
+
+    agg = pd.concat([g_lrt_lo, g_lrt_hi, g_ind_lo, g_ind_hi], ignore_index=True)
+    agg = agg.sort_values(xcol)
+
+    # --- plotting ---
+    ax.axhline(0.0, linestyle="--", linewidth=1.0)
+    if is_N and N_guideline is not None:
+        ax.axvline(
+            float(N_guideline), linestyle="--", linewidth=1.2, color="tab:orange"
+        )
+    if (not is_N) and c_boundary is not None:
+        ax.axvline(float(c_boundary), linestyle="--", linewidth=1.2, color="tab:orange")
+
+    ax.grid(True, linestyle="dashdot", linewidth=0.5)
+
+    # LRT (blue)
+    s = agg[agg["series"] == "LRT_lower"]
+    ln = ax.plot(
+        s[xcol],
+        s["mean"],
+        linestyle="-",
+        marker="v",
+        label=r"LRT: Upper $-$ $\hat{\varepsilon}_\mathrm{lower}$",
+    )
+    c_lrt = ln[0].get_color()
+    ax.errorbar(
+        s[xcol], s["mean"], yerr=s["std"], linestyle="None", capsize=3, color=c_lrt
+    )
+
+    s2: pd.DataFrame = agg[agg["series"] == "LRT_upper"]
+    ax.plot(
+        s2[xcol],
+        s2["mean"],
+        linestyle=":",
+        marker="^",
+        color=c_lrt,
+        label=r"LRT: Upper $-$ $\hat{\varepsilon}_\mathrm{upper}$",
+    )
+    ax.errorbar(
+        s2[xcol], s2["mean"], yerr=s2["std"], linestyle="None", capsize=3, color=c_lrt
+    )
+
+    # LRT_decomp (purple)
+    base = "tab:purple"
+    s3: pd.DataFrame = agg[agg["series"] == "DECOMP_lower"]
+    ax.plot(
+        s3[xcol],
+        s3["mean"],
+        linestyle="-",
+        marker="v",
+        color=base,
+        linewidth=2.5,
+        label=r"LRT_Decomp: Upper $-$ $\hat{\varepsilon}_\mathrm{lower}$",
+    )
+    ax.errorbar(
+        s3[xcol], s3["mean"], yerr=s3["std"], linestyle="None", capsize=3, color=base
+    )
+
+    s4: pd.DataFrame = agg[agg["series"] == "DECOMP_upper"]
+    ax.plot(
+        s4[xcol],
+        s4["mean"],
+        linestyle=":",
+        marker="^",
+        color=base,
+        label=r"LRT_Decomp: Upper $-$ $\hat{\varepsilon}_\mathrm{upper}$",
+    )
+    ax.errorbar(
+        s4[xcol], s4["mean"], yerr=s4["std"], linestyle="None", capsize=3, color=base
+    )
+
+    ax.set_xscale("log")
+    if fixed_value is not None and fixed_label is not None:
+        ax.set_xlabel(f"{xcol} (fixed {fixed_label} = {fixed_value:g})", fontsize=25)
+    else:
+        ax.set_xlabel(xcol, fontsize=25)
+
+
+    h, l = ax.get_legend_handles_labels()
+    return h, l
+
+
+def plot_N_c_sweep_2x2(
+    *,
+    csv_N: str,
+    csv_c: str,
+    outpath: str,
+    epsilon_theoretical: float = 1.0,
+    k: int = 2,
+    c_for_guideline: float = 1e-2,
+    alpha: float = 1e-2,
+    omega: float = 0.005,
+    shift_list: list[float] | None = None,
+) -> None:
+    dfN = pd.read_csv(csv_N)
+    dfC = pd.read_csv(csv_c)
+
+    if shift_list is None:
+        shift_list = sorted(
+            set(dfN["mean_shift"].dropna().astype(float))
+            & set(dfC["mean_shift"].dropna().astype(float))
+        )
+    shift_list = shift_list[:2]  # [0.1, 0.5]
+
+    fig, axes = plt.subplots(2, 2, figsize=(11.5, 7.2), sharey=True)
+    axes = np.atleast_2d(axes)
+
+    all_handles, all_labels = [], []
+
+    for c_idx, shift in enumerate(shift_list):
+        # ---- row 0: N-sweep ----
+        h, l = _plot_sweep_gap_panel(
+            axes[0, c_idx],
+            dfN,
+            is_N=True,
+            mean_shift=float(shift),
+            epsilon_theoretical=epsilon_theoretical,
+            k=k,
+            c_for_guideline=c_for_guideline,
+            alpha=alpha,
+            omega=omega,
+        )
+        axes[0, c_idx].set_title(f"mean_shift = {shift}", fontsize=22)
+        axes[1, c_idx].set_title(f"mean_shift = {shift}", fontsize=22)
+
+        # ---- row 1: c-sweep ----
+        h2, l2 = _plot_sweep_gap_panel(
+            axes[1, c_idx],
+            dfC,
+            is_N=False,
+            mean_shift=float(shift),
+            epsilon_theoretical=epsilon_theoretical,
+            k=k,
+            c_for_guideline=c_for_guideline,
+            alpha=alpha,
+            omega=omega,
+        )
+
+        for hh, ll in zip(h + h2, l + l2):
+            if ll not in all_labels:
+                all_handles.append(hh)
+                all_labels.append(ll)
+
+    # row labels
+    axes[0, 0].set_ylabel(r"Upper $-$ $\hat{\varepsilon}_\mathrm{CI}$", fontsize=22)
+    axes[1, 0].set_ylabel(r"Upper $-$ $\hat{\varepsilon}_\mathrm{CI}$", fontsize=22)
+
+    # legend
+    fig.legend(
+        all_handles,
+        all_labels,
+        loc="upper center",
+        ncol=2,
+        bbox_to_anchor=(0.5, 1.02),
+        frameon=True,
+        fontsize=21,
+    )
+
+    fig.tight_layout(rect=(0.04, 0.0, 1.0, 0.90))
+    Path(outpath).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(outpath, dpi=300, bbox_inches="tight")
+    plt.show()
+
 
 def _main_cli() -> None:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     # ---- subcommand: lrt_compare（今まで通り） ----
-    p1 = sub.add_parser("lrt_compare")
+    p1: argparse.ArgumentParser = sub.add_parser("lrt_compare")
     p1.add_argument(
         "-csv_list",
         "--csv_list",
@@ -1102,6 +1729,41 @@ def _main_cli() -> None:
         help="Domain size k. If omitted, inferred from first CSV.",
     )
 
+    # ---- subcommand: N_c_sweep（新規） ----
+    p3 = sub.add_parser("N_c_sweep")
+    p3.add_argument(
+        "--csv_N",
+        default="./results/20260116/N_sweep_eps=1.0_c=0.01_k=2_seeds=5.csv",
+        help="N-sweep result csv path.",
+    )
+    p3.add_argument(
+        "--csv_c",
+        default="./results/20260116/c_sweep_N=500000_eps=1.0_k=2_seeds=5.csv",
+        help="c-sweep result csv path.",
+    )
+    p3.add_argument(
+        "--out",
+        default="results/fig_N_c_sweep_2x2.pdf",
+        help="Output pdf path.",
+    )
+    p3.add_argument("--epsilon", type=float, default=1.0)
+    p3.add_argument("--k", type=int, default=2)
+    p3.add_argument("--alpha", type=float, default=1e-2)
+    p3.add_argument("--omega", type=float, default=0.005)
+    p3.add_argument(
+        "--c_for_guideline",
+        type=float,
+        default=1e-2,
+        help="For N-sweep guideline line: N_guideline(c_for_guideline).",
+    )
+    p3.add_argument(
+        "--shifts",
+        type=float,
+        nargs="*",
+        default=None,
+        help="Optional mean_shift list (use first two for 2x2). e.g. --shifts 0.1 0.5",
+    )
+
     args: argparse.Namespace = parser.parse_args()
 
     if args.cmd == "lrt_compare":
@@ -1134,6 +1796,18 @@ def _main_cli() -> None:
             k=args.k,
             lst_protocol=["GRR", "LRT"],
         )
+    elif args.cmd == "N_c_sweep":
+        plot_N_c_sweep_2x2(
+            csv_N=args.csv_N,
+            csv_c=args.csv_c,
+            outpath=args.out,
+            epsilon_theoretical=float(args.epsilon),
+            k=int(args.k),
+            c_for_guideline=float(args.c_for_guideline),
+            alpha=float(args.alpha),
+            omega=float(args.omega),
+            shift_list=(list(args.shifts) if args.shifts is not None else None),
+        )
 
 
 if __name__ == "__main__":
@@ -1152,3 +1826,20 @@ if __name__ == "__main__":
 #   --out results/fig_results_summary_audit_2x2.pdf \
 #   --epsilon 1.0 \
 #   --k 2
+
+# python plot_functions.py lrt_compare \
+#   -csv_list \
+#     ./results/20260207/shift=0.1_c=0.01_decomp.csv \
+#     ./results/20260207/shift=0.1_c=0.001_decomp.csv \
+#     ./results/20260207/shift=2.0_c=0.01_decomp.csv \
+#     ./results/20260207/shift=2.0_c=0.001_decomp.csv \
+#   --titles "mean_shift=0.1, c=1e-2" "mean_shift=0.1, c=1e-3" "mean_shift=2.0, c=1e-2" "mean_shift=2.0, c=1e-3" \
+#   --out results/fig_lrt_compare_2x2.pdf \
+#   --k 2 \
+#   --yscale log
+
+# python plot_functions.py N_c_sweep \
+#   --csv_N ./results/20260116/N_sweep_eps=1.0_c=0.01_k=2_seeds=5.csv \
+#   --csv_c ./results/20260116/c_sweep_N=500000_eps=1.0_k=2_seeds=5.csv \
+#   --out results/fig_N_c_sweep_2x2.pdf \
+#   --shifts 0.1 0.5
