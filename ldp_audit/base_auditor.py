@@ -1,8 +1,10 @@
 # General imports
 import warnings
 from collections import defaultdict
-from typing import Any, Literal, Self
+from typing import Any, Literal, Self, Callable, Sequence
 
+from matplotlib.pylab import Generator
+from sklearn.pipeline import Pipeline
 import numpy as np
 import psutil
 
@@ -24,6 +26,8 @@ from scipy.optimize import OptimizeResult, minimize_scalar
 from scipy.special import erfinv
 from statsmodels.stats.proportion import proportion_confint
 
+from ldp_audit.eta_models import EtaModelConfig
+
 from .approximate_ldp import AGRR_Client, ALH_Client, ASUE_Client, GM_Client, find_scale
 from .attacks import (
     attack_gm,
@@ -36,12 +40,18 @@ from .attacks import (
     attack_ue,
     grr_sample_binary,
 )
+from .eta_models import (
+    get_default_eta_model_configs,
+    fit_and_select_eta_model,
+    predict_eta,
+)
 from .simulation import (
     MixtureSpec,
     log_Rmax_gaussian,
     posterior_probs_from_x,
     sample_x_given_y_truncated,
     set_B_from_quantile,
+    sample_attack_trainset_from_spec,
 )
 
 # Our imports
@@ -295,17 +305,21 @@ class LDPAuditor:
         beta = min(max(beta, 1e-6), 0.49)
 
         # --- Guideline 1 terms ---
-        # N1 = 2(1-c)/(omega^2 c)
-        term1: float = 2.0 * (1.0 - c_val) / (omega**2 * c_val)
+        # base terms inside max(.)
+        # B1 = 2(1-c)/(omega^2 c)
+        base1: float = 2.0 * (1.0 - c_val) / (omega**2 * c_val)
 
-        # N2 = 8(1-c)/c * (erf^{-1}(1-2beta))^2
+        # B2 = 8(1-c)/c
+        base2: float = 8.0 * (1.0 - c_val) / c_val
+
+        # common factor: (erf^{-1}(1-2beta))^2
         erf_arg: float = 1.0 - 2.0 * beta
         # numerical safety: clip into (-1,1)
         erf_arg = float(np.clip(erf_arg, -0.999999, 0.999999))
         inv_val: float = float(erfinv(erf_arg))
-        term2: float = 8.0 * (1.0 - c_val) / c_val * (inv_val**2)
+        erf_sq: float = inv_val**2
 
-        suggested: int = int(np.ceil(max(term1, term2)))
+        suggested: int = int(np.ceil(max(base1, base2) * erf_sq))
         print("Suggested nb_trials from dynamic adjustment:", suggested)
 
         # avoid runaway trial counts
@@ -368,6 +382,325 @@ class LDPAuditor:
         return count
     
     ############# LRT 監査用の関数群 #############
+
+    ##### eta 学習モデルをつかう #####
+    def _sample_p_theta_hat(self, y_input: int, n: int, rng: np.random.Generator, eta_model) -> np.ndarray:
+        """
+        完全LRT用：eta(x) を学習モデルで推定する版
+        Pr[Y=1 | x, \tilde y] スコアの ndarray を返す
+        """
+        if self.spec is None:
+            raise ValueError("spec must be set.")
+        
+        # 事後分布から X をサンプリング
+        X: np.ndarray = sample_x_given_y_truncated(n=n, spec=self.spec, y=y_input, rng=rng, B=self.B)
+        X = self.project_l2_ball(X, B=self.B)
+
+        eta_hat: np.ndarray = predict_eta(eta_model, X)
+        ytilde: np.ndarray = grr_sample_binary(y=y_input, n=n, epsilon=float(self.epsilon), rng=rng)
+
+        # LRT の対数スコア Λ(x,\tilde y) を計算
+        llr: np.ndarray = attack_lrt_scores(ytilde, eta_hat, float(self.epsilon))
+        # sigmoid = つまり Pr[Y=1|x,\tilde y]
+        p = 1.0 / (1.0 + np.exp(-llr))
+        return p
+
+
+    def _sample_score_x_hat(self, y_input: int, n: int, rng: np.random.Generator, eta_model) -> np.ndarray:
+        """
+        X-only（Decomposition）用：score_x = logit(eta_hat(x))
+        """
+        if self.spec is None:
+            raise ValueError("spec must be set.")
+        X: np.ndarray = sample_x_given_y_truncated(n=n, spec=self.spec, y=y_input, rng=rng, B=self.B)
+        X = self.project_l2_ball(X, B=self.B)
+
+        eta_hat: np.ndarray = predict_eta(eta_model, X)
+        score_x = np.log(eta_hat) - np.log(1.0 - eta_hat)
+        return score_x
+
+    def evaluate_eps_with_dp_sniper_cp_hat(
+        self,
+        tau: float,
+        q: float,
+        rng: np.random.Generator,
+        eta_model,
+        attack: Literal["complete_LRT_hat", "tilde y=1 only LRT_hat", "indirect_LRT_hat"],
+    ) -> dict:
+        """
+        学習etaモデルを使う版の評価
+        TP, FP, tpr_hat, fpr_hat, eps_emp, eps_ci などを入れた dict を返す
+        """
+        if self.spec is None:
+            raise ValueError("spec must be set for evaluation.")
+
+        # 試行回数 for 評価 （Guideline1 に従う）
+        N_final = int(self.nb_trials)
+
+        def _sample_attack_outputs(p: np.ndarray) -> int:
+            # S^{tau,q}(.) を実際にサンプルして「1 を出した回数」を返す
+            atol = 1e-12
+            tau_eff: float = max(float(tau), 1e-15)
+            gt: np.ndarray = p > tau_eff + atol
+            eq: np.ndarray = np.abs(p - tau_eff) <= atol
+            out: np.ndarray = np.zeros(p.shape[0], dtype=np.int64)
+            out[gt] = 1
+            if np.any(eq):
+                out[eq] = (rng.random(np.sum(eq)) < q).astype(np.int64)
+            return int(out.sum())
+
+        if attack == "complete_LRT_hat":
+            p1: np.ndarray = self._sample_p_theta_hat(1, N_final, rng, eta_model=eta_model)
+            p0: np.ndarray = self._sample_p_theta_hat(0, N_final, rng, eta_model=eta_model)
+
+        elif attack == "tilde y=1 only LRT_hat":        # 無視で良い
+            score1 = self._sample_score_x_hat(1, N_final, rng, eta_model=eta_model)
+            score0 = self._sample_score_x_hat(0, N_final, rng, eta_model=eta_model)
+
+            ytilde1 = grr_sample_binary(
+                y=1, n=N_final, epsilon=float(self.epsilon), rng=rng
+            )
+            ytilde0 = grr_sample_binary(
+                y=0, n=N_final, epsilon=float(self.epsilon), rng=rng
+            )
+
+            p1 = np.zeros(N_final, dtype=np.float64)
+            p0 = np.zeros(N_final, dtype=np.float64)
+
+            m1 = ytilde1 == 1
+            m0 = ytilde0 == 1
+
+            p1[m1] = 1.0 / (1.0 + np.exp(-score1[m1]))
+            p0[m0] = 1.0 / (1.0 + np.exp(-score0[m0]))
+
+        elif attack == "indirect_LRT_hat":
+            score1: np.ndarray = self._sample_score_x_hat(1, N_final, rng, eta_model=eta_model)
+            score0: np.ndarray = self._sample_score_x_hat(0, N_final, rng, eta_model=eta_model)
+            p1 = 1.0 / (1.0 + np.exp(-score1))
+            p0 = 1.0 / (1.0 + np.exp(-score0))
+
+        else:
+            raise ValueError("Unknown attack type")
+
+        TP: int = _sample_attack_outputs(p1)
+        FP: int = _sample_attack_outputs(p0)
+
+        tpr_hat: float = TP / N_final
+        fpr_hat: float = FP / N_final
+
+        tpr_lo, tpr_hi = proportion_confint(TP, N_final, alpha=self.alpha, method="beta")
+        fpr_lo, fpr_hi = proportion_confint(FP, N_final, alpha=self.alpha, method="beta")
+
+        # DP-Sniper の c-power: ln_{>=c}(x)=ln(max(c, x)) を使う
+        # FPR が validation/test で c を割り込んだ場合でも下駄履きで安定化する
+        c_floor: float = max(float(self.c), 1e-12)
+        eps_emp = float(np.log(max(tpr_hat, c_floor) / max(fpr_hat, c_floor)))
+        eps_lower = float(np.log(max(tpr_lo, c_floor) / max(fpr_hi, c_floor)))
+        eps_upper = float(np.log(max(tpr_hi, c_floor) / max(fpr_lo, c_floor)))
+
+        return {
+            "TP": TP,
+            "FP": FP,
+            "N_final": N_final,
+            "tpr_hat": float(tpr_hat),
+            "fpr_hat": float(fpr_hat),
+            "tpr_ci": (float(tpr_lo), float(tpr_hi)),       # type: ignore
+            "fpr_ci": (float(fpr_lo), float(fpr_hi)),       # type: ignore
+            "eps_emp": eps_emp,
+            "eps_ci": (eps_lower, eps_upper),
+        }
+    
+    def _select_score_fn_for_eta_model(
+        self,
+        *,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+        selection: Literal["eps_lower", "eps_emp", "tpr_at_fpr"] = "eps_lower",
+        rng_seed_for_val: int = 0,
+        attack_for_selection: Literal[
+            "indirect_LRT_hat", "complete_LRT_hat"
+        ] = "indirect_LRT_hat",
+    )-> Callable[..., float]:
+        """
+        eta_model（sklearn pipeline）を受け取って,val上のスカラーを返す score_fn を作る.
+        ※dp_sniperのtau,qは, valの「y=0側 predicted eta」から作る.
+        """
+        rng_local: Generator = np.random.default_rng(rng_seed_for_val)
+
+        def score_fn(model) -> float:
+            # y=0側 model によって predicted eta から dp_sniper で tau,q （eta を渡すので OK）
+            eta0: np.ndarray = predict_eta(model, X_val[y_val == 0])
+            tau, q = dp_sniper_threshold_from_scores(eta0, c=self.c)
+            tau = float(np.clip(tau, 1e-15, 1.0 - 1e-15))
+            q = float(np.clip(q, 0.0, 1.0))
+
+            # valで監査指標を測る（乱数の揺れを小さくしたければ nb_trials をここだけ増やす/固定seedでOK）
+            res: dict = self.evaluate_eps_with_dp_sniper_cp_hat(
+                tau=tau,
+                q=q,
+                rng=rng_local,
+                eta_model=model,
+                attack=(
+                    "indirect_LRT_hat"
+                    if attack_for_selection == "indirect_LRT_hat"
+                    else "complete_LRT_hat"
+                ),
+            )
+
+            # TODO: return は再考の余地あり
+            if selection == "eps_emp":
+                return float(res["eps_emp"])
+            if selection == "tpr_at_fpr":
+                # DP-Sniper の c-power では fpr を c で下駄履きするため
+                # 追加の目標 FPR は不要。tau, q は dp_sniper_threshold_from_scores で
+                # y=0 サンプル上位 c を切る設計なので各モデルで FPR はおおむね揃う。
+                return float(res["tpr_hat"])
+            # default: eps_lower
+            return float(res["eps_ci"][0])
+
+        return score_fn
+
+
+    def run_eta_model_comparison_4way(
+        self,
+        *,
+        # 共通
+        seed: int = 0,
+        selection: Literal["eps_lower", "eps_emp", "tpr_at_fpr"] = "eps_lower",
+        attack_for_selection: Literal[
+            "indirect_LRT_hat", "complete_LRT_hat"
+        ] = "indirect_LRT_hat",
+        attack_for_report: Literal[
+            "complete_LRT_hat", "tilde y=1 only LRT_hat", "indirect_LRT_hat"
+        ] = "complete_LRT_hat",
+        attack_for_report_extra: Sequence[
+            Literal["complete_LRT_hat", "tilde y=1 only LRT_hat", "indirect_LRT_hat"]
+        ] | None = None,
+        eta_model_cfgs: Sequence[EtaModelConfig] | None = None,
+        # simulation用（実データなら None でOK）
+        sim_n_train: int | None = 4000,
+        sim_n_val: int | None = 2000,
+        # 実データ用（simulationなら None でOK）
+        X_train: np.ndarray | None = None,
+        y_train: np.ndarray | None = None,
+        X_val: np.ndarray | None = None,
+        y_val: np.ndarray | None = None,
+    ) -> dict:
+        """
+        4モデルそれぞれで best hyperparam を選び、test評価（= evaluate）を返す。
+        - simulation: sim_n_train/sim_n_val を指定し、specからデータ生成
+        - real: X_train,y_train,X_val,y_val を渡す
+        """
+        if self.spec is None:
+            raise ValueError("spec must be set.")
+
+        rng: Generator = np.random.default_rng(seed)
+        rng_train: Generator = np.random.default_rng(rng.integers(1 << 32))
+        rng_val: Generator = np.random.default_rng(rng.integers(1 << 32))
+        rng_test: Generator = np.random.default_rng(rng.integers(1 << 32))
+
+        # --- train/val データを用意 （simulation data 用） ---
+        if X_train is None:
+            if sim_n_train is None or sim_n_val is None:
+                raise ValueError("For simulation mode, set sim_n_train and sim_n_val.")
+            # y も含めてサンプリング
+            X_train, y_train = sample_attack_trainset_from_spec(
+                n=sim_n_train,
+                spec=self.spec,
+                rng=rng_train,
+                B=self.B,
+                project_fn=self.project_l2_ball,
+            )
+            X_val, y_val = sample_attack_trainset_from_spec(
+                n=sim_n_val,
+                spec=self.spec,
+                rng=rng_val,
+                B=self.B,
+                project_fn=self.project_l2_ball,
+            )
+        else:
+            # real mode
+            assert y_train is not None and X_val is not None and y_val is not None
+
+        # --- score_fn（val上で dp_sniper→監査指標） ---
+        score_fn: Callable[..., float] = self._select_score_fn_for_eta_model(
+            X_val=X_val,
+            y_val=y_val,
+            selection=selection,
+            rng_seed_for_val=int(rng.integers(1 << 31)),
+            attack_for_selection=attack_for_selection,
+        )
+
+        # --- 4モデルをそれぞれ選択 ---
+        cfgs: list[EtaModelConfig] = (
+            list(eta_model_cfgs) if eta_model_cfgs is not None else get_default_eta_model_configs()
+        )
+        per_model_best: dict[str, dict[str, Any]] = {}
+
+        for cfg in cfgs:
+            # best = {"score": s,"params": dict(params),"model": model}
+            # 各モデルごとに fit + select （val上で score_fn が最大となるハイパーパラメータを探索）
+            best: dict[str, Any] = fit_and_select_eta_model(
+                cfg=cfg,
+                X_train=X_train,
+                y_train=y_train,
+                X_val=X_val,
+                y_val=y_val,
+                seed=int(rng.integers(1 << 31)),
+                score_fn=score_fn,
+            )
+            per_model_best[cfg.name] = best
+
+        report_attacks: list[
+            Literal["complete_LRT_hat", "tilde y=1 only LRT_hat", "indirect_LRT_hat"]
+        ] = [attack_for_report]
+        if attack_for_report_extra is not None:
+            for a in attack_for_report_extra:
+                if a not in report_attacks:
+                    report_attacks.append(a)
+
+        # --- report: 各モデルの best を使って test評価（tau,qは valのy=0から作る設計に合わせる） ---
+        report = {}
+        for name, best in per_model_best.items():
+            # fitted model with best hyperparameters
+            model: Pipeline = best["model"]
+
+            # tau,q を val の y=0 側 predicted eta から決定
+            eta0: np.ndarray = predict_eta(model, X_val[y_val == 0])
+            tau, q = dp_sniper_threshold_from_scores(eta0, c=self.c)
+            tau = float(np.clip(tau, 1e-15, 1.0 - 1e-15))
+            q = float(np.clip(q, 0.0, 1.0))
+
+            tests_by_attack: dict[str, dict[str, Any]] = {}
+            for attack_name in report_attacks:
+                rng_for_attack: Generator = np.random.default_rng(rng_test.integers(1 << 32))
+                res_test: dict = self.evaluate_eps_with_dp_sniper_cp_hat(
+                    tau=tau,
+                    q=q,
+                    rng=rng_for_attack,
+                    eta_model=model,
+                    attack=attack_name,
+                )
+                tests_by_attack[str(attack_name)] = res_test
+
+            report[name] = {
+                "selected_by": selection,
+                "best_val_score": float(best["score"]),
+                "params": best["params"],
+                "tau": tau,
+                "q": q,
+                "test": tests_by_attack[str(attack_for_report)],
+                "tests_by_attack": tests_by_attack,
+                "attack_for_report": attack_for_report,
+            }
+
+        return {
+            "selection": selection,
+            "attack_for_selection": attack_for_selection,
+            "attack_for_report": attack_for_report,
+            "results": report,
+        }
+
 
     ##### L2 ボール投影（eta を壊さず logRmax を厳密に計算するため） #####
     def project_l2_ball(self, X: np.ndarray, B: float) -> np.ndarray:
@@ -600,6 +933,7 @@ class LDPAuditor:
         # Y=0 側の score_x から閾値
         scores_val: np.ndarray = self._sample_score_x(0, N_sniper, rng_val)
         p_val = 1.0 / (1.0 + np.exp(-scores_val))          # sigmoid
+        # sigmoid(logit(eta)) = eta に注意
         tau, q = dp_sniper_threshold_from_scores(p_val, c=self.c)
 
         # 数値安全：tau が 0 に落ちる事故を避ける
