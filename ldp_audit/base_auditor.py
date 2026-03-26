@@ -425,7 +425,9 @@ class LDPAuditor:
         q: float,
         rng: np.random.Generator,
         eta_model,
-        attack: Literal["complete_LRT_hat", "tilde y=1 only LRT_hat", "indirect_LRT_hat"],
+        attack: Literal["complete_LRT_hat", "tilde y=y_alt only LRT_hat", "indirect_LRT_hat"],
+        y_alt: int = 1,
+        y_null: int = 0,
     ) -> dict:
         """
         学習etaモデルを使う版の評価
@@ -450,32 +452,32 @@ class LDPAuditor:
             return int(out.sum())
 
         if attack == "complete_LRT_hat":
-            p1: np.ndarray = self._sample_p_theta_hat(1, N_final, rng, eta_model=eta_model)
-            p0: np.ndarray = self._sample_p_theta_hat(0, N_final, rng, eta_model=eta_model)
+            p1: np.ndarray = self._sample_p_theta_hat(y_alt, N_final, rng, eta_model=eta_model)
+            p0: np.ndarray = self._sample_p_theta_hat(y_null, N_final, rng, eta_model=eta_model)
 
-        elif attack == "tilde y=1 only LRT_hat":        # 無視で良い
-            score1 = self._sample_score_x_hat(1, N_final, rng, eta_model=eta_model)
-            score0 = self._sample_score_x_hat(0, N_final, rng, eta_model=eta_model)
+        elif attack == "tilde y=y_alt only LRT_hat":        # 無視で良い
+            score1 = self._sample_score_x_hat(y_alt, N_final, rng, eta_model=eta_model)
+            score0 = self._sample_score_x_hat(y_null, N_final, rng, eta_model=eta_model)
 
             ytilde1 = grr_sample_binary(
-                y=1, n=N_final, epsilon=float(self.epsilon), rng=rng
+                y=y_alt, n=N_final, epsilon=float(self.epsilon), rng=rng
             )
             ytilde0 = grr_sample_binary(
-                y=0, n=N_final, epsilon=float(self.epsilon), rng=rng
+                y=y_null, n=N_final, epsilon=float(self.epsilon), rng=rng
             )
 
             p1 = np.zeros(N_final, dtype=np.float64)
             p0 = np.zeros(N_final, dtype=np.float64)
 
-            m1 = ytilde1 == 1
-            m0 = ytilde0 == 1
+            m1 = ytilde1 == y_alt
+            m0 = ytilde0 == y_alt
 
             p1[m1] = 1.0 / (1.0 + np.exp(-score1[m1]))
             p0[m0] = 1.0 / (1.0 + np.exp(-score0[m0]))
 
         elif attack == "indirect_LRT_hat":
-            score1: np.ndarray = self._sample_score_x_hat(1, N_final, rng, eta_model=eta_model)
-            score0: np.ndarray = self._sample_score_x_hat(0, N_final, rng, eta_model=eta_model)
+            score1: np.ndarray = self._sample_score_x_hat(y_alt, N_final, rng, eta_model=eta_model)
+            score0: np.ndarray = self._sample_score_x_hat(y_null, N_final, rng, eta_model=eta_model)
             p1 = 1.0 / (1.0 + np.exp(-score1))
             p0 = 1.0 / (1.0 + np.exp(-score0))
 
@@ -520,21 +522,37 @@ class LDPAuditor:
         attack_for_selection: Literal[
             "indirect_LRT_hat", "complete_LRT_hat"
         ] = "indirect_LRT_hat",
-    )-> Callable[..., float]:
+        y_alt: int = 1,
+        y_null: int = 0,
+    ) -> Callable[..., float]:
         """
         eta_model（sklearn pipeline）を受け取って,val上のスカラーを返す score_fn を作る.
-        ※dp_sniperのtau,qは, valの「y=0側 predicted eta」から作る.
+        attack_for_selection に応じて、null 側スコアから dp-sniper の tau,q を決める。
+        - indirect_LRT_hat: y=0 側 predicted eta から tau,q
+        - complete_LRT_hat: y=0 側の complete-LRT pseudo-probability から tau,q
         """
         rng_local: Generator = np.random.default_rng(rng_seed_for_val)
 
         def score_fn(model) -> float:
-            # y=0側 model によって predicted eta から dp_sniper で tau,q （eta を渡すので OK）
-            eta0: np.ndarray = predict_eta(model, X_val[y_val == 0])
-            tau, q = dp_sniper_threshold_from_scores(eta0, c=self.c)
+            # attack_for_selection に応じて null 側スコアから tau,q を作る
+            if attack_for_selection == "indirect_LRT_hat":
+                scores_null: np.ndarray = predict_eta(model, X_val[y_val == y_null])
+            elif attack_for_selection == "complete_LRT_hat":
+                rng_tau: Generator = np.random.default_rng(rng_seed_for_val + 12345)
+                scores_null = self._sample_p_theta_hat(
+                    y_input=y_null,
+                    n=int(np.sum(y_val == y_null)),
+                    rng=rng_tau,
+                    eta_model=model,
+                )
+            else:
+                raise ValueError(f"Unknown attack_for_selection: {attack_for_selection}")
+
+            tau, q = dp_sniper_threshold_from_scores(scores_null, c=self.c)
             tau = float(np.clip(tau, 1e-15, 1.0 - 1e-15))
             q = float(np.clip(q, 0.0, 1.0))
 
-            # valで監査指標を測る（乱数の揺れを小さくしたければ nb_trials をここだけ増やす/固定seedでOK）
+            # valで監査指標を測る
             res: dict = self.evaluate_eps_with_dp_sniper_cp_hat(
                 tau=tau,
                 q=q,
@@ -545,17 +563,14 @@ class LDPAuditor:
                     if attack_for_selection == "indirect_LRT_hat"
                     else "complete_LRT_hat"
                 ),
+                y_alt=y_alt,
+                y_null=y_null,
             )
 
-            # TODO: return は再考の余地あり
             if selection == "eps_emp":
                 return float(res["eps_emp"])
             if selection == "tpr_at_fpr":
-                # DP-Sniper の c-power では fpr を c で下駄履きするため
-                # 追加の目標 FPR は不要。tau, q は dp_sniper_threshold_from_scores で
-                # y=0 サンプル上位 c を切る設計なので各モデルで FPR はおおむね揃う。
                 return float(res["tpr_hat"])
-            # default: eps_lower
             return float(res["eps_ci"][0])
 
         return score_fn
@@ -570,11 +585,8 @@ class LDPAuditor:
         attack_for_selection: Literal[
             "indirect_LRT_hat", "complete_LRT_hat"
         ] = "indirect_LRT_hat",
-        attack_for_report: Literal[
-            "complete_LRT_hat", "tilde y=1 only LRT_hat", "indirect_LRT_hat"
-        ] = "complete_LRT_hat",
-        attack_for_report_extra: Sequence[
-            Literal["complete_LRT_hat", "tilde y=1 only LRT_hat", "indirect_LRT_hat"]
+        report_attacks: Sequence[
+            Literal["complete_LRT_hat", "tilde y=y_alt only LRT_hat", "indirect_LRT_hat"]
         ] | None = None,
         eta_model_cfgs: Sequence[EtaModelConfig] | None = None,
         # simulation用（実データなら None でOK）
@@ -585,6 +597,8 @@ class LDPAuditor:
         y_train: np.ndarray | None = None,
         X_val: np.ndarray | None = None,
         y_val: np.ndarray | None = None,
+        y_alt: int = 1,
+        y_null: int = 0,
     ) -> dict:
         """
         4モデルそれぞれで best hyperparam を選び、test評価（= evaluate）を返す。
@@ -629,6 +643,8 @@ class LDPAuditor:
             selection=selection,
             rng_seed_for_val=int(rng.integers(1 << 31)),
             attack_for_selection=attack_for_selection,
+            y_alt=y_alt,
+            y_null=y_null,
         )
 
         # --- 4モデルをそれぞれ選択 ---
@@ -651,28 +667,45 @@ class LDPAuditor:
             )
             per_model_best[cfg.name] = best
 
-        report_attacks: list[
-            Literal["complete_LRT_hat", "tilde y=1 only LRT_hat", "indirect_LRT_hat"]
-        ] = [attack_for_report]
-        if attack_for_report_extra is not None:
-            for a in attack_for_report_extra:
-                if a not in report_attacks:
-                    report_attacks.append(a)
+        report_attack_list: list[
+            Literal["complete_LRT_hat", "tilde y=y_alt only LRT_hat", "indirect_LRT_hat"]
+        ] = (
+            list(report_attacks)
+            if report_attacks is not None
+            else [attack_for_selection]
+        )
+        report_attack_list = list(dict.fromkeys(report_attack_list))
+        if len(report_attack_list) == 0:
+            raise ValueError("report_attacks must be non-empty.")
+        primary_report_attack = report_attack_list[0]
 
-        # --- report: 各モデルの best を使って test評価（tau,qは valのy=0から作る設計に合わせる） ---
+        # --- report: 各モデルの best を使って test評価（attack ごとに tau,q を作る） ---
         report = {}
         for name, best in per_model_best.items():
             # fitted model with best hyperparameters
             model: Pipeline = best["model"]
 
-            # tau,q を val の y=0 側 predicted eta から決定
-            eta0: np.ndarray = predict_eta(model, X_val[y_val == 0])
-            tau, q = dp_sniper_threshold_from_scores(eta0, c=self.c)
-            tau = float(np.clip(tau, 1e-15, 1.0 - 1e-15))
-            q = float(np.clip(q, 0.0, 1.0))
-
             tests_by_attack: dict[str, dict[str, Any]] = {}
-            for attack_name in report_attacks:
+            tau_q_by_attack: dict[str, dict[str, float]] = {}
+            for attack_name in report_attack_list:
+                if attack_name == "indirect_LRT_hat":
+                    scores_null: np.ndarray = predict_eta(model, X_val[y_val == y_null])
+                elif attack_name == "complete_LRT_hat":
+                    rng_tau: Generator = np.random.default_rng(int(rng.integers(1 << 31)))
+                    scores_null = self._sample_p_theta_hat(
+                        y_input=y_null,
+                        n=int(np.sum(y_val == y_null)),
+                        rng=rng_tau,
+                        eta_model=model,
+                    )
+                else:
+                    scores_null = predict_eta(model, X_val[y_val == y_null])
+
+                tau, q = dp_sniper_threshold_from_scores(scores_null, c=self.c)
+                tau = float(np.clip(tau, 1e-15, 1.0 - 1e-15))
+                q = float(np.clip(q, 0.0, 1.0))
+                tau_q_by_attack[str(attack_name)] = {"tau": tau, "q": q}
+
                 rng_for_attack: Generator = np.random.default_rng(rng_test.integers(1 << 32))
                 res_test: dict = self.evaluate_eps_with_dp_sniper_cp_hat(
                     tau=tau,
@@ -680,6 +713,8 @@ class LDPAuditor:
                     rng=rng_for_attack,
                     eta_model=model,
                     attack=attack_name,
+                    y_alt=y_alt,
+                    y_null=y_null,
                 )
                 tests_by_attack[str(attack_name)] = res_test
 
@@ -687,17 +722,19 @@ class LDPAuditor:
                 "selected_by": selection,
                 "best_val_score": float(best["score"]),
                 "params": best["params"],
-                "tau": tau,
-                "q": q,
-                "test": tests_by_attack[str(attack_for_report)],
+                "tau": tau_q_by_attack[str(primary_report_attack)]["tau"],
+                "q": tau_q_by_attack[str(primary_report_attack)]["q"],
+                "tau_q_attack": primary_report_attack,
+                "tau_q_by_attack": tau_q_by_attack,
+                "test": tests_by_attack[str(primary_report_attack)],
                 "tests_by_attack": tests_by_attack,
-                "attack_for_report": attack_for_report,
+                "report_attacks": [str(a) for a in report_attack_list],
             }
 
         return {
             "selection": selection,
             "attack_for_selection": attack_for_selection,
-            "attack_for_report": attack_for_report,
+            "report_attacks": [str(a) for a in report_attack_list],
             "results": report,
         }
 
@@ -767,7 +804,9 @@ class LDPAuditor:
         tau: float,
         q: float,
         rng: np.random.Generator,
-        attack: Literal["complete_LRT", "tilde y=1 only LRT", "indirect_LRT"],
+        attack: Literal["complete_LRT", "tilde y=y_alt only LRT", "indirect_LRT"],
+        y_alt: int = 1,
+        y_null: int = 0,
     ) -> dict:
         """
         固定した (tau,q) の攻撃 S^{tau,q} を N_final=self.nb_trials 回評価し，
@@ -792,51 +831,50 @@ class LDPAuditor:
                 out[eq] = (rng.random(np.sum(eq)) < q).astype(np.int64)
             return int(out.sum())
 
-        # --- TPR: y=1 を入れた時に攻撃が 1 を出す確率 ---
-        # --- FPR: y=0 を入れた時に攻撃が 1 を出す確率 ---
+        # TPR = P(attack=1 | Y=y_alt), FPR = P(attack=1 | Y=y_null)
         if attack == "complete_LRT":
             ######## 完全 LRT 監査 ########
-            p1: np.ndarray = self._sample_p_theta(1, N_final, rng)
-            p0: np.ndarray = self._sample_p_theta(0, N_final, rng)
-        elif attack == "tilde y=1 only LRT":
-            ######## tilde y=1 only LRT 監査 ########
+            p_alt: np.ndarray = self._sample_p_theta(y_alt, N_final, rng)
+            p_null: np.ndarray = self._sample_p_theta(y_null, N_final, rng)
+        elif attack == "tilde y=y_alt only LRT":
+            ######## tilde y=y_alt only LRT 監査 ########
             # 1) X のスコア
-            score1: np.ndarray = self._sample_score_x(1, N_final, rng)
-            score0: np.ndarray = self._sample_score_x(0, N_final, rng)
+            score_alt: np.ndarray = self._sample_score_x(y_alt, N_final, rng)
+            score_null: np.ndarray = self._sample_score_x(y_null, N_final, rng)
 
             # 2) tilde y を生成（入力 y を固定してGRR）
-            ytilde1: np.ndarray = grr_sample_binary(
-                y=1, n=N_final, epsilon=float(self.epsilon), rng=rng
+            ytilde_alt: np.ndarray = grr_sample_binary(
+                y=y_alt, n=N_final, epsilon=float(self.epsilon), rng=rng
             )
-            ytilde0: np.ndarray = grr_sample_binary(
-                y=0, n=N_final, epsilon=float(self.epsilon), rng=rng
+            ytilde_null: np.ndarray = grr_sample_binary(
+                y=y_null, n=N_final, epsilon=float(self.epsilon), rng=rng
             )
 
-            # 3) 「受理条件」: tilde y == 1 のときだけスコアで判定、それ以外は必ず0
+            # 3) 「受理条件」: tilde y == y_alt のときだけスコアで判定、それ以外は必ず0
             #    dp_sniper_threshold_from_scores が「大きいほど1」前提なので score を logistic にして渡す
-            p1 = np.zeros(N_final, dtype=np.float64)
-            p0 = np.zeros(N_final, dtype=np.float64)
+            p_alt = np.zeros(N_final, dtype=np.float64)
+            p_null = np.zeros(N_final, dtype=np.float64)
 
-            m1: np.ndarray = ytilde1 == 1
-            m0: np.ndarray = ytilde0 == 1
+            m_alt: np.ndarray = ytilde_alt == y_alt
+            m_null: np.ndarray = ytilde_null == y_alt
 
             # score -> pseudo-prob (単調変換ならOK): sigmoid(score)
-            p1[m1] = 1.0 / (1.0 + np.exp(-score1[m1]))
-            p0[m0] = 1.0 / (1.0 + np.exp(-score0[m0]))
+            p_alt[m_alt] = 1.0 / (1.0 + np.exp(-score_alt[m_alt]))
+            p_null[m_null] = 1.0 / (1.0 + np.exp(-score_null[m_null]))
         elif attack == "indirect_LRT":
             ######## 間接 LRT 監査 ########
             # 1) X のスコア: logit(eta(x))
-            p1: np.ndarray = self._sample_score_x(1, N_final, rng)
-            p0: np.ndarray = self._sample_score_x(0, N_final, rng)
+            p_alt: np.ndarray = self._sample_score_x(y_alt, N_final, rng)
+            p_null: np.ndarray = self._sample_score_x(y_null, N_final, rng)
 
-            p1 = 1.0 / (1.0 + np.exp(-p1))  # sigmoid(score)
-            p0 = 1.0 / (1.0 + np.exp(-p0))  # sigmoid(score)
+            p_alt = 1.0 / (1.0 + np.exp(-p_alt))  # sigmoid(score)
+            p_null = 1.0 / (1.0 + np.exp(-p_null))  # sigmoid(score)
         else:
             raise ValueError("Unknown attack type for LRT-CF evaluation.")
 
 
-        TP: int = _sample_attack_outputs(p1)
-        FP: int = _sample_attack_outputs(p0)
+        TP: int = _sample_attack_outputs(p_alt)
+        FP: int = _sample_attack_outputs(p_null)
 
         tpr_hat: float = TP / N_final
         fpr_hat: float = FP / N_final
@@ -870,14 +908,20 @@ class LDPAuditor:
         rng: np.random.Generator = np.random.default_rng(self.random_state)
 
         # val 用 rng / test 用 rng を分離
-        rng_val = np.random.default_rng(rng.integers(1 << 32))
-        rng_test = np.random.default_rng(rng.integers(1 << 32))
+        rng_val: Generator = np.random.default_rng(rng.integers(1 << 32))
+        rng_test: Generator = np.random.default_rng(rng.integers(1 << 32))
 
         # ------------- 検証（検証用データで最適な tau を決める） --------------
         # N_sniper 回ぶんの (x_i, ytilde_i) を作る
         N_sniper: int = self.nb_trials
-        scores_val: np.ndarray = self._sample_p_theta(0, N_sniper, rng_val)
-        tau, q = dp_sniper_threshold_from_scores(scores_val, c=self.c)
+
+        # ----- direction01 : y=0 側のスコアから tau を決める（TPR=Pr[S=1|Y=1], FPR=Pr[S=1|Y=0] の FPR を下駄履き安定化） -----
+        scores_null0: np.ndarray = self._sample_p_theta(0, N_sniper, rng_val)
+        tau_null0, q_null0 = dp_sniper_threshold_from_scores(scores_null0, c=self.c)
+
+        # ----- direction10 : y=1 側のスコアから tau を決める（TPR=Pr[S=1|Y=0], FPR=Pr[S=1|Y=1] の FPR を下駄履き安定化） -----
+        scores_null1: np.ndarray = self._sample_p_theta(1, N_sniper, rng_val)
+        tau_null1, q_null1 = dp_sniper_threshold_from_scores(scores_null1, c=self.c)
 
         # ---  Effective log R_max を追加 ---
         if self.logRmax_eff and np.isfinite(self.logRmax_eff) and self.logRmax_eff > 0:
@@ -901,7 +945,12 @@ class LDPAuditor:
         
         # -------------- 評価（CP 付き eps_emp） --------------
         # c-clipping は compute_tpr_fpr 内で実装
-        results: dict = self.evaluate_eps_with_dp_sniper_cp(tau=tau, q=q, rng=rng_test, attack="complete_LRT")
+        # direction01 も direction10 も試して、より厳しい方を採用する
+        results10: dict = self.evaluate_eps_with_dp_sniper_cp(
+            tau=tau_null0, q=q_null0, rng=rng_test, attack="complete_LRT", y_alt=1, y_null=0)
+        results01: dict = self.evaluate_eps_with_dp_sniper_cp(
+            tau=tau_null1, q=q_null1, rng=rng_test, attack="complete_LRT", y_alt=0, y_null=1)
+        results: dict = results01 if results01["eps_emp"] > results10["eps_emp"] else results10
         self.eps_emp = results['eps_emp']
         eps_lo, eps_hi = results['eps_ci']
         self.eps_ci = (float(eps_lo), float(eps_hi))
@@ -909,7 +958,8 @@ class LDPAuditor:
         # ------------- DEBUG 出力 -------------
         print("=== LRT DEBUG ===")
         print(f"eps={self.epsilon}, seed={self.random_state}, c={self.c}")
-        print(f"tau={tau:.6g}, q={q:.6g}")
+        print(f"tau01={tau_null1:.6g}, q01={q_null1:.6g}")
+        print(f"tau10={tau_null0:.6g}, q10={q_null0:.6g}")
         print(f"tpr={results['tpr_hat']:.6g}, fpr={results['fpr_hat']:.6g}")
         print(f"eps_emp(computed)={np.log(max(results['tpr_hat'],1e-12)/max(results['fpr_hat'],1e-12)):.6g}")
         print(f"eps_lo={eps_lo:.6g}, eps_hi={eps_hi:.6g}")
@@ -917,10 +967,11 @@ class LDPAuditor:
         return self.eps_emp
 
 
-    ############# tilde y=1 only LRT 監査用の関数 #############
-    def _run_lrt_tilde1_once(self) -> float:
+    ############# tilde y=y_alt only LRT 監査用の関数 #############
+    # メンテナンスしていない - y_alt になっていない部分多数
+    def _run_lrt_tilde_y_alt_once(self) -> float: 
         """
-        tilde y=1 のみ受理する攻撃者：
+        tilde y=y_alt のみ受理する攻撃者：
         - 閾値は X-only score (=logit eta) の Y=0 側分布から dp-sniper で決める
         - a = log(TPR_x/FPR_x) を CP で推定し、最後に + epsilon_GRR する
         """
@@ -974,28 +1025,42 @@ class LDPAuditor:
 
         N_sniper: int = self.nb_trials
 
-        # Y=0 側の score_x から閾値
-        scores_val: np.ndarray = self._sample_score_x(0, N_sniper, rng_val)
-        p_val = 1.0 / (1.0 + np.exp(-scores_val))          # sigmoid
-        tau, q = dp_sniper_threshold_from_scores(p_val, c=self.c)
+        # direction10 : y=0 側のスコアから tau を決める（TPR=Pr[S=1|Y=1], FPR=Pr[S=1|Y=0] の FPR を下駄履き安定化）
+        scores_null0: np.ndarray = self._sample_score_x(0, N_sniper, rng_val)
+        p_null0 = 1.0 / (1.0 + np.exp(-scores_null0))          # sigmoid
+        tau_null0, q_null0 = dp_sniper_threshold_from_scores(p_null0, c=self.c)
 
         # a を評価 （X-only）
-        res_a: dict = self.evaluate_eps_with_dp_sniper_cp(
-            tau=tau, q=q, rng=rng_test, attack="indirect_LRT"
+        res_a10: dict = self.evaluate_eps_with_dp_sniper_cp(
+            tau=tau_null0, q=q_null0, rng=rng_test, attack="indirect_LRT", y_alt=1, y_null=0
         )
-        a_emp : float = float(res_a["eps_emp"])
-        a_lo, a_hi = res_a["eps_ci"]
+        a_emp10 : float = float(res_a10["eps_emp"])
+        a_lo10, a_hi10 = res_a10["eps_ci"]
 
-        # tilde y=1 受理の“合成”に相当する分だけ +epsilon_GRR
+        # direction01 : y=1 側のスコアから tau を決める（TPR=Pr[S=1|Y=0], FPR=Pr[S=1|Y=1] の FPR を下駄履き安定化）
+        scores_null1: np.ndarray = self._sample_score_x(1, N_sniper, rng_val)
+        p_null1 = 1.0 / (1.0 + np.exp(-scores_null1))          # sigmoid
+        tau_null1, q_null1 = dp_sniper_threshold_from_scores(p_null1, c=self.c)
+
+        # a を評価 （X-only）
+        res_a01: dict = self.evaluate_eps_with_dp_sniper_cp(
+            tau=tau_null1, q=q_null1, rng=rng_test, attack="indirect_LRT", y_alt=0, y_null=1
+        )
+        a_emp01 : float = float(res_a01["eps_emp"])
+        a_lo01, a_hi01 = res_a01["eps_ci"]
+
+        # tilde y=y_alt 受理の“合成”に相当する分だけ +epsilon_GRR
         eps_grr: float = float(self.epsilon)  # GRR の ε は既知
 
-        self.eps_emp = a_emp + eps_grr
-        self.eps_ci = (float(a_lo + eps_grr), float(a_hi + eps_grr))
+        self.eps_emp = max(a_emp01, a_emp10) + eps_grr
+        self.eps_ci = (float(max(a_lo01, a_lo10) + eps_grr), float(max(a_hi01, a_hi10) + eps_grr))
 
         print("=== indirect LRT DEBUG ===")
         print(f"eps={self.epsilon}, seed={self.random_state}, c={self.c}")
-        print(f"tau={tau:.6g}, q={q:.6g}")
-        print(f"a_lo={a_lo:.6g}, a_hi={a_hi:.6g}")
+        print(f"tau_null0={tau_null0:.6g}, q_null0q={q_null0:.6g}")
+        print(f"a_lo10={a_lo10:.6g}, a_hi10={a_hi10:.6g}")
+        print(f"tau_null1={tau_null1:.6g}, q_null1={q_null1:.6g}")
+        print(f"a_lo01={a_lo01:.6g}, a_hi01={a_hi01:.6g}")
         print(f"eps_emp=a+eps_grr={self.eps_emp:.6g}")
         print(f"eps_ci=({self.eps_ci[0]:.6g}, {self.eps_ci[1]:.6g})")
         print("=== /indirect LRT DEBUG ===")
@@ -1676,7 +1741,7 @@ class LDPAuditor:
             except Exception:
                 pass
             self.nb_cores = 1
-            return self._run_lrt_tilde1_once()
+            return self._run_lrt_tilde_y_alt_once()       
         elif protocol_name == "LRT_indirect":
             # indirect LRT も Ray 不要。確実に止める
             try:
