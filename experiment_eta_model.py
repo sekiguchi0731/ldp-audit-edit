@@ -47,9 +47,6 @@ class EtaExperimentConfig:
 
     # selection/report config
     selection: Literal["eps_lower", "eps_emp", "tpr_at_fpr"] = "eps_lower"
-    attack_for_selection: Literal["indirect_LRT_hat", "complete_LRT_hat"] = (
-        "complete_LRT_hat"
-    )
     # If True, evaluate both complete/indirect attacks with attack-specific tau,q.
     evaluate_both_reports: bool = True
     use_reduced_grid: bool = True
@@ -139,13 +136,10 @@ def run_eta_model_experiments(
         - In real-data mode, pass X_train,y_train,X_val,y_val. (labels must be 0/1)
     """
     logging.info("=== run_eta_model_experiments ===")
-    attack_for_selection_used = cast(
-        Literal["indirect_LRT_hat", "complete_LRT_hat"], cfg.attack_for_selection
-    )
     report_attacks: tuple[Literal["indirect_LRT_hat", "complete_LRT_hat"], ...] = (
         ("complete_LRT_hat", "indirect_LRT_hat")
         if cfg.evaluate_both_reports
-        else (attack_for_selection_used,)
+        else ("complete_LRT_hat",)
     )
     eps_list: list[float] = [float(eps) for eps in cfg.epsilon_list]
     if len(eps_list) == 0:
@@ -161,10 +155,9 @@ def run_eta_model_experiments(
         )
 
     logging.info(
-        "analysis=%s selection=%s attack_sel=%s report_attacks=%s eps=%s reduced_grid=%s hyperparameter=%s",
+        "analysis=%s selection=%s report_attacks=%s eps=%s reduced_grid=%s hyperparameter=%s",
         cfg.analysis,
         cfg.selection,
-        attack_for_selection_used,
         report_attacks,
         eps_list,
         cfg.use_reduced_grid,
@@ -234,6 +227,7 @@ def run_eta_model_experiments(
         seed: int,
         protocol: str,
         epsilon: float,
+        attack_for_selection: str,
         metric: str,
         value: float | int | None,
         params_json: str | None,
@@ -250,7 +244,7 @@ def run_eta_model_experiments(
             nb_trials=int(cfg.nb_trials),
             alpha=float(cfg.alpha),
             selection=str(cfg.selection),
-            attack_for_selection=str(attack_for_selection_used),
+            attack_for_selection=attack_for_selection,
             attack_for_report=attack_for_report,
             sim_d=sim_d_row,
             sim_sigma=sim_sigma_row,
@@ -292,7 +286,6 @@ def run_eta_model_experiments(
             out: dict = auditor.run_eta_model_comparison_4way(
                 seed=int(seed),
                 selection=cfg.selection,
-                attack_for_selection=attack_for_selection_used,
                 report_attacks=report_attacks,
                 eta_model_cfgs=eta_model_cfgs,
                 sim_n_train=cfg.sim_n_train if X_train is None else None,
@@ -307,21 +300,43 @@ def run_eta_model_experiments(
 
             for model_name, info in out["results"].items():
                 protocol: str = f"ETA_{model_name}"
-                params_json: str | None = (
-                    json.dumps(info["params"], sort_keys=True)
-                    if info.get("params") is not None
-                    else None
-                )
-
-                append_row(
-                    seed=int(seed),
-                    protocol=protocol,
-                    epsilon=epsilon,
-                    metric="val_score",
-                    value=float(info["best_val_score"]),
-                    params_json=params_json,
-                    attack_for_report=str(report_attacks[0]),
-                )
+                best_by_attack: dict[str, dict] = info.get("best_by_attack", {})
+                params_json_by_attack: dict[str, str | None] = {}
+                if best_by_attack:
+                    for attack_name, best in best_by_attack.items():
+                        params_json: str | None = (
+                            json.dumps(best["params"], sort_keys=True)
+                            if best.get("params") is not None
+                            else None
+                        )
+                        params_json_by_attack[str(attack_name)] = params_json
+                        append_row(
+                            seed=int(seed),
+                            protocol=protocol,
+                            epsilon=epsilon,
+                            attack_for_selection=str(attack_name),
+                            metric="val_score",
+                            value=float(best["best_val_score"]),
+                            params_json=params_json,
+                            attack_for_report=str(attack_name),
+                        )
+                else:
+                    params_json = (
+                        json.dumps(info["params"], sort_keys=True)
+                        if info.get("params") is not None
+                        else None
+                    )
+                    params_json_by_attack[str(report_attacks[0])] = params_json
+                    append_row(
+                        seed=int(seed),
+                        protocol=protocol,
+                        epsilon=epsilon,
+                        attack_for_selection=str(report_attacks[0]),
+                        metric="val_score",
+                        value=float(info["best_val_score"]),
+                        params_json=params_json,
+                        attack_for_report=str(report_attacks[0]),
+                    )
                 tests_by_attack: dict[str, dict] = info.get("tests_by_attack", {})
                 tau_q_by_attack: dict[str, dict[str, float]] = info.get("tau_q_by_attack", {})
                 if tau_q_by_attack:
@@ -330,18 +345,20 @@ def run_eta_model_experiments(
                             seed=int(seed),
                             protocol=protocol,
                             epsilon=epsilon,
+                            attack_for_selection=str(attack_name),
                             metric="tau",
                             value=float(tau_q["tau"]),
-                            params_json=params_json,
+                            params_json=params_json_by_attack.get(str(attack_name)),
                             attack_for_report=str(attack_name),
                         )
                         append_row(
                             seed=int(seed),
                             protocol=protocol,
                             epsilon=epsilon,
+                            attack_for_selection=str(attack_name),
                             metric="q",
                             value=float(tau_q["q"]),
-                            params_json=params_json,
+                            params_json=params_json_by_attack.get(str(attack_name)),
                             attack_for_report=str(attack_name),
                         )
                 else:
@@ -349,18 +366,20 @@ def run_eta_model_experiments(
                         seed=int(seed),
                         protocol=protocol,
                         epsilon=epsilon,
+                        attack_for_selection=str(report_attacks[0]),
                         metric="tau",
                         value=float(info["tau"]),
-                        params_json=params_json,
+                        params_json=params_json_by_attack.get(str(report_attacks[0])),
                         attack_for_report=str(report_attacks[0]),
                     )
                     append_row(
                         seed=int(seed),
                         protocol=protocol,
                         epsilon=epsilon,
+                        attack_for_selection=str(report_attacks[0]),
                         metric="q",
                         value=float(info["q"]),
-                        params_json=params_json,
+                        params_json=params_json_by_attack.get(str(report_attacks[0])),
                         attack_for_report=str(report_attacks[0]),
                     )
                 if not tests_by_attack and "test" in info:
@@ -371,9 +390,10 @@ def run_eta_model_experiments(
                         seed=int(seed),
                         protocol=protocol,
                         epsilon=epsilon,
+                        attack_for_selection=str(attack_name),
                         metric="test_eps_emp",
                         value=float(test["eps_emp"]),
-                        params_json=params_json,
+                        params_json=params_json_by_attack.get(str(attack_name)),
                         attack_for_report=str(attack_name),
                     )
                     eps_lo, eps_hi = test["eps_ci"]
@@ -381,63 +401,66 @@ def run_eta_model_experiments(
                         seed=int(seed),
                         protocol=protocol,
                         epsilon=epsilon,
+                        attack_for_selection=str(attack_name),
                         metric="test_eps_lower",
                         value=float(eps_lo),
-                        params_json=params_json,
+                        params_json=params_json_by_attack.get(str(attack_name)),
                         attack_for_report=str(attack_name),
                     )
                     append_row(
                         seed=int(seed),
                         protocol=protocol,
                         epsilon=epsilon,
+                        attack_for_selection=str(attack_name),
                         metric="test_eps_upper",
                         value=float(eps_hi),
-                        params_json=params_json,
+                        params_json=params_json_by_attack.get(str(attack_name)),
                         attack_for_report=str(attack_name),
                     )
                     append_row(
                         seed=int(seed),
                         protocol=protocol,
                         epsilon=epsilon,
+                        attack_for_selection=str(attack_name),
                         metric="test_tpr_hat",
                         value=float(test["tpr_hat"]),
-                        params_json=params_json,
+                        params_json=params_json_by_attack.get(str(attack_name)),
                         attack_for_report=str(attack_name),
                     )
                     append_row(
                         seed=int(seed),
                         protocol=protocol,
                         epsilon=epsilon,
+                        attack_for_selection=str(attack_name),
                         metric="test_fpr_hat",
                         value=float(test["fpr_hat"]),
-                        params_json=params_json,
+                        params_json=params_json_by_attack.get(str(attack_name)),
                         attack_for_report=str(attack_name),
                     )
                     append_row(
                         seed=int(seed),
                         protocol=protocol,
                         epsilon=epsilon,
+                        attack_for_selection=str(attack_name),
                         metric="test_TP",
                         value=int(test["TP"]),
-                        params_json=params_json,
+                        params_json=params_json_by_attack.get(str(attack_name)),
                         attack_for_report=str(attack_name),
                     )
                     append_row(
                         seed=int(seed),
                         protocol=protocol,
                         epsilon=epsilon,
+                        attack_for_selection=str(attack_name),
                         metric="test_FP",
                         value=int(test["FP"]),
-                        params_json=params_json,
+                        params_json=params_json_by_attack.get(str(attack_name)),
                         attack_for_report=str(attack_name),
                     )
 
     df = pd.DataFrame(rows)
 
-    out_csv: str = (
-        f"results/eta_hat_{cfg.analysis}_"
-        f"sel={attack_for_selection_used}.csv"
-    )
+    out_csv: str = f"results/20260326/eta_hat_shift={cfg.sim_mean_shift}_c={cfg.c}_f={cfg.nb_trials}_t={cfg.sim_n_train}_v={cfg.sim_n_val}_d={cfg.sim_d}.csv"
     logging.info("Saving eta-model results to %s", out_csv)
     df.to_csv(out_csv, index=False)
 
@@ -453,12 +476,6 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
     parser = argparse.ArgumentParser(description="Run eta-model comparison experiment.")
-    parser.add_argument(
-        "--attack_for_selection",
-        choices=["complete_LRT_hat", "indirect_LRT_hat"],
-        default="complete_LRT_hat",
-        help="Attack used for model/parameter selection.",
-    )
     parser.add_argument(
         "--evaluate_both_reports",
         action="store_true",
@@ -498,7 +515,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--analysis",
         type=str,
-        default="shift=0.1_c=1e-2_eps=0.25_10_complete_select_reduced",
+        default="shift=0.1_c=1e-2_eps=0.25_10_f=10000_t=1000_v=1000",
     )
     parser.add_argument("--seed_start", type=int, default=0)
     parser.add_argument("--seed_end", type=int, default=5)
@@ -515,10 +532,6 @@ if __name__ == "__main__":
         y_alt=args.y_alt,
         y_null=args.y_null,
         selection=cast(Literal["eps_lower", "eps_emp", "tpr_at_fpr"], args.selection),
-        attack_for_selection=cast(
-            Literal["indirect_LRT_hat", "complete_LRT_hat"],
-            args.attack_for_selection,
-        ),
         evaluate_both_reports=bool(args.evaluate_both_reports),
         use_reduced_grid=bool(args.use_reduced_grid),
         hyperparameter=cast(Literal["grid", "fixed"], args.hyperparameter),
@@ -538,20 +551,10 @@ if __name__ == "__main__":
     print(df.head(20))
 
 # python experiment_eta_model.py \
-#   --attack_for_selection complete_LRT_hat \
 #   --evaluate_both_reports \
 #   --use_reduced_grid
 
-# python experiment_eta_model.py \
-#   --attack_for_selection indirect_LRT_hat \
-#   --use_reduced_grid
-
-# python experiment_eta_model.py \
-#   --attack_for_selection complete_LRT_hat \
-#   --use_reduced_grid
-
 # time python experiment_eta_model.py \
-#   --attack_for_selection complete_LRT_hat \
 #   --evaluate_both_reports \
 #   --nb_trials  10000 \
 #   --sim_n_train 1000 \

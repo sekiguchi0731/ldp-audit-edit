@@ -1,7 +1,7 @@
 # General imports
 import warnings
 from collections import defaultdict
-from typing import Any, Literal, Self, Callable, Sequence
+from typing import Any, Literal, Self, Callable, Sequence, cast
 
 from matplotlib.pylab import Generator
 from sklearn.pipeline import Pipeline
@@ -582,9 +582,6 @@ class LDPAuditor:
         # 共通
         seed: int = 0,
         selection: Literal["eps_lower", "eps_emp", "tpr_at_fpr"] = "eps_lower",
-        attack_for_selection: Literal[
-            "indirect_LRT_hat", "complete_LRT_hat"
-        ] = "indirect_LRT_hat",
         report_attacks: Sequence[
             Literal["complete_LRT_hat", "tilde y=y_alt only LRT_hat", "indirect_LRT_hat"]
         ] | None = None,
@@ -636,58 +633,74 @@ class LDPAuditor:
             # real mode
             assert y_train is not None and X_val is not None and y_val is not None
 
-        # --- score_fn（val上で dp_sniper→監査指標） ---
-        score_fn: Callable[..., float] = self._select_score_fn_for_eta_model(
-            X_val=X_val,
-            y_val=y_val,
-            selection=selection,
-            rng_seed_for_val=int(rng.integers(1 << 31)),
-            attack_for_selection=attack_for_selection,
-            y_alt=y_alt,
-            y_null=y_null,
-        )
-
-        # --- 4モデルをそれぞれ選択 ---
         cfgs: list[EtaModelConfig] = (
             list(eta_model_cfgs) if eta_model_cfgs is not None else get_default_eta_model_configs()
         )
-        per_model_best: dict[str, dict[str, Any]] = {}
-
-        for cfg in cfgs:
-            # best = {"score": s,"params": dict(params),"model": model}
-            # 各モデルごとに fit + select （val上で score_fn が最大となるハイパーパラメータを探索）
-            best: dict[str, Any] = fit_and_select_eta_model(
-                cfg=cfg,
-                X_train=X_train,
-                y_train=y_train,
-                X_val=X_val,
-                y_val=y_val,
-                seed=int(rng.integers(1 << 31)),
-                score_fn=score_fn,
-            )
-            per_model_best[cfg.name] = best
 
         report_attack_list: list[
             Literal["complete_LRT_hat", "tilde y=y_alt only LRT_hat", "indirect_LRT_hat"]
         ] = (
             list(report_attacks)
             if report_attacks is not None
-            else [attack_for_selection]
+            else ["complete_LRT_hat", "indirect_LRT_hat"]
         )
         report_attack_list = list(dict.fromkeys(report_attack_list))
         if len(report_attack_list) == 0:
             raise ValueError("report_attacks must be non-empty.")
-        primary_report_attack = report_attack_list[0]
+        primary_report_attack: Literal['complete_LRT_hat', 'tilde y=y_alt only LRT_hat', 'indirect_LRT_hat'] = report_attack_list[0]
+
+        selection_attack_list: list[Literal["complete_LRT_hat", "indirect_LRT_hat"]] = []
+        for attack_name in report_attack_list:
+            if attack_name not in ("complete_LRT_hat", "indirect_LRT_hat"):
+                raise ValueError(
+                    "Per-attack model selection currently supports only "
+                    "'complete_LRT_hat' and 'indirect_LRT_hat'."
+                )
+            selection_attack_list.append(cast(Literal["complete_LRT_hat", "indirect_LRT_hat"], attack_name))
+
+        per_attack_model_best: dict[str, dict[str, dict[str, Any]]] = {}
+        for selection_attack in selection_attack_list:
+            score_fn: Callable[..., float] = self._select_score_fn_for_eta_model(
+                X_val=X_val,
+                y_val=y_val,
+                selection=selection,
+                rng_seed_for_val=int(rng.integers(1 << 31)),
+                attack_for_selection=selection_attack,
+                y_alt=y_alt,
+                y_null=y_null,
+            )
+
+            per_model_best: dict[str, dict[str, Any]] = {}
+            for cfg in cfgs:
+                # best = {"score": s,"params": dict(params),"model": model}
+                # 各モデルごとに fit + select （val上で score_fn が最大となるハイパーパラメータを探索）
+                best: dict[str, Any] = fit_and_select_eta_model(
+                    cfg=cfg,
+                    X_train=X_train,
+                    y_train=y_train,
+                    X_val=X_val,
+                    y_val=y_val,
+                    seed=int(rng.integers(1 << 31)),
+                    score_fn=score_fn,
+                )
+                per_model_best[cfg.name] = best
+            per_attack_model_best[str(selection_attack)] = per_model_best
 
         # --- report: 各モデルの best を使って test評価（attack ごとに tau,q を作る） ---
         report = {}
-        for name, best in per_model_best.items():
-            # fitted model with best hyperparameters
-            model: Pipeline = best["model"]
-
+        for cfg in cfgs:
+            name: str = cfg.name
             tests_by_attack: dict[str, dict[str, Any]] = {}
             tau_q_by_attack: dict[str, dict[str, float]] = {}
+            best_by_attack: dict[str, dict[str, Any]] = {}
             for attack_name in report_attack_list:
+                best: dict[str, Any] = per_attack_model_best[str(attack_name)][name]
+                model: Pipeline = best["model"]
+                best_by_attack[str(attack_name)] = {
+                    "best_val_score": float(best["score"]),
+                    "params": best["params"],
+                }
+
                 if attack_name == "indirect_LRT_hat":
                     scores_null: np.ndarray = predict_eta(model, X_val[y_val == y_null])
                 elif attack_name == "complete_LRT_hat":
@@ -720,8 +733,9 @@ class LDPAuditor:
 
             report[name] = {
                 "selected_by": selection,
-                "best_val_score": float(best["score"]),
-                "params": best["params"],
+                "best_val_score": float(best_by_attack[str(primary_report_attack)]["best_val_score"]),
+                "params": best_by_attack[str(primary_report_attack)]["params"],
+                "best_by_attack": best_by_attack,
                 "tau": tau_q_by_attack[str(primary_report_attack)]["tau"],
                 "q": tau_q_by_attack[str(primary_report_attack)]["q"],
                 "tau_q_attack": primary_report_attack,
@@ -733,7 +747,6 @@ class LDPAuditor:
 
         return {
             "selection": selection,
-            "attack_for_selection": attack_for_selection,
             "report_attacks": [str(a) for a in report_attack_list],
             "results": report,
         }
