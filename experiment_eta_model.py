@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import argparse
-
+import ast
 import json
 import logging
-from dataclasses import dataclass
-from typing import Iterable, Literal, cast
+from dataclasses import dataclass, replace
+from typing import Iterable, Literal, Sequence, cast
 
 import numpy as np
 import pandas as pd
@@ -59,9 +59,149 @@ class EtaExperimentConfig:
     sim_rmax_alpha: float = 1e-6
     sim_n_train: int = 4000
     sim_n_val: int = 2000
+    n_total: int | None = None
+    ratio_train: float | None = None
+    ratio_val: float | None = None
+    ratio_final: float | None = None
 
     # output
     analysis: str = "eta_model_comparison"
+
+
+def _validate_ratio_triplet(ratio: Sequence[float]) -> tuple[float, float, float]:
+    if len(ratio) != 3:
+        raise ValueError(f"N_ratio must contain exactly 3 values, got {ratio}.")
+    r_train, r_val, r_final = (float(r) for r in ratio)
+    if min(r_train, r_val, r_final) <= 0.0:
+        raise ValueError(f"N_ratio values must be positive, got {ratio}.")
+    if not np.isclose(r_train + r_val + r_final, 1.0, atol=1e-8):
+        raise ValueError(f"N_ratio must sum to 1.0, got {ratio}.")
+    return r_train, r_val, r_final
+
+
+def _parse_n_ratio_args(
+    raw_values: Sequence[str] | None,
+) -> list[tuple[float, float, float]] | None:
+    if raw_values is None or len(raw_values) == 0:
+        return None
+
+    text: str = " ".join(raw_values).strip()
+    if text.startswith("[") or text.startswith("("):
+        parsed = ast.literal_eval(text)
+        if (
+            isinstance(parsed, tuple)
+            and len(parsed) == 3
+            and all(isinstance(v, (int, float)) for v in parsed)
+        ):
+            return [_validate_ratio_triplet(tuple(float(v) for v in parsed))]
+        if not isinstance(parsed, (list, tuple)):
+            raise ValueError(f"Could not parse N_ratio from: {text}")
+        return [
+            _validate_ratio_triplet(tuple(float(v) for v in item)) for item in parsed
+        ]
+
+    ratios: list[tuple[float, float, float]] = []
+    for token in raw_values:
+        cleaned: str = token.strip().strip("[]()")
+        parts: list[str] = [p.strip() for p in cleaned.split(",") if p.strip()]
+        if len(parts) != 3:
+            raise ValueError(
+                f"Each N_ratio token must look like '0.1,0.1,0.8'. Got: {token}"
+            )
+        ratios.append(_validate_ratio_triplet(tuple(float(p) for p in parts)))
+    return ratios
+
+
+def _format_ratio_for_path(x: float) -> str:
+    return f"{float(x):.3f}".rstrip("0").rstrip(".")
+
+
+def _resolve_count_plan(
+    *,
+    n_total: int,
+    ratio: tuple[float, float, float],
+    nb_trials_override: int | None,
+    sim_n_train_override: int | None,
+    sim_n_val_override: int | None,
+) -> tuple[int, int, int]:
+    ratio_train, ratio_val, ratio_final = ratio
+
+    sim_n_train: int = (
+        int(sim_n_train_override)
+        if sim_n_train_override is not None
+        else int(round(n_total * ratio_train))
+    )
+    sim_n_val: int = (
+        int(sim_n_val_override)
+        if sim_n_val_override is not None
+        else int(round(n_total * ratio_val))
+    )
+    if nb_trials_override is not None:
+        nb_trials = int(nb_trials_override)
+    elif sim_n_train_override is None and sim_n_val_override is None:
+        nb_trials = int(n_total - sim_n_train - sim_n_val)
+    else:
+        nb_trials = int(round(n_total * ratio_final))
+
+    if min(sim_n_train, sim_n_val, nb_trials) <= 0:
+        raise ValueError(
+            "Resolved counts must be positive. "
+            f"Got sim_n_train={sim_n_train}, sim_n_val={sim_n_val}, nb_trials={nb_trials}."
+        )
+    return sim_n_train, sim_n_val, nb_trials
+
+
+def _build_ratio_cfgs(
+    *,
+    base_cfg: EtaExperimentConfig,
+    n_total: int | None,
+    ratios: list[tuple[float, float, float]] | None,
+    nb_trials_override: int | None,
+    sim_n_train_override: int | None,
+    sim_n_val_override: int | None,
+) -> list[EtaExperimentConfig]:
+    if n_total is None:
+        return [base_cfg]
+
+    if ratios is None or len(ratios) == 0:
+        if (
+            nb_trials_override is not None
+            and sim_n_train_override is not None
+            and sim_n_val_override is not None
+        ):
+            return [replace(base_cfg, n_total=int(n_total))]
+        raise ValueError(
+            "When N_total is set, N_ratio must also be set unless all three counts are explicitly overridden."
+        )
+
+    cfgs: list[EtaExperimentConfig] = []
+    for ratio in ratios:
+        ratio_train, ratio_val, ratio_final = ratio
+        sim_n_train, sim_n_val, nb_trials = _resolve_count_plan(
+            n_total=int(n_total),
+            ratio=ratio,
+            nb_trials_override=nb_trials_override,
+            sim_n_train_override=sim_n_train_override,
+            sim_n_val_override=sim_n_val_override,
+        )
+        analysis_suffix: str = (
+            f"_Ntotal={int(n_total)}"
+            f"_r={_format_ratio_for_path(ratio_train)}-{_format_ratio_for_path(ratio_val)}-{_format_ratio_for_path(ratio_final)}"
+        )
+        cfgs.append(
+            replace(
+                base_cfg,
+                nb_trials=nb_trials,
+                sim_n_train=sim_n_train,
+                sim_n_val=sim_n_val,
+                n_total=int(n_total),
+                ratio_train=ratio_train,
+                ratio_val=ratio_val,
+                ratio_final=ratio_final,
+                analysis=f"{base_cfg.analysis}{analysis_suffix}",
+            )
+        )
+    return cfgs
 
 
 def _append_metric(
@@ -83,6 +223,10 @@ def _append_metric(
     sim_mean_shift: float | None,
     sim_n_train: int | None,
     sim_n_val: int | None,
+    n_total: int | None,
+    ratio_train: float | None,
+    ratio_val: float | None,
+    ratio_final: float | None,
     metric: str,
     value: float | int | None,
     params_json: str | None,
@@ -106,6 +250,10 @@ def _append_metric(
     rows["sim_mean_shift"].append(sim_mean_shift)
     rows["sim_n_train"].append(sim_n_train)
     rows["sim_n_val"].append(sim_n_val)
+    rows["n_total"].append(n_total)
+    rows["ratio_train"].append(ratio_train)
+    rows["ratio_val"].append(ratio_val)
+    rows["ratio_final"].append(ratio_final)
 
     rows["metric"].append(metric)
     rows["value"].append(value)
@@ -182,6 +330,10 @@ def run_eta_model_experiments(
         "sim_mean_shift": [],
         "sim_n_train": [],
         "sim_n_val": [],
+        "n_total": [],
+        "ratio_train": [],
+        "ratio_val": [],
+        "ratio_final": [],
         "metric": [],
         "value": [],
         "params_json": [],
@@ -251,6 +403,10 @@ def run_eta_model_experiments(
             sim_mean_shift=sim_mean_shift_row,
             sim_n_train=sim_n_train_row,
             sim_n_val=sim_n_val_row,
+            n_total=cfg.n_total,
+            ratio_train=cfg.ratio_train,
+            ratio_val=cfg.ratio_val,
+            ratio_final=cfg.ratio_final,
             metric=metric,
             value=value,
             params_json=params_json,
@@ -460,7 +616,7 @@ def run_eta_model_experiments(
 
     df = pd.DataFrame(rows)
 
-    out_csv: str = f"results/20260326/eta_hat_shift={cfg.sim_mean_shift}_c={cfg.c}_f={cfg.nb_trials}_t={cfg.sim_n_train}_v={cfg.sim_n_val}_d={cfg.sim_d}.csv"
+    out_csv: str = f"results/20260326v2/eta_hat_shift={cfg.sim_mean_shift}_c={cfg.c}_f={cfg.nb_trials}_t={cfg.sim_n_train}_v={cfg.sim_n_val}_d={cfg.sim_d}.csv"
     logging.info("Saving eta-model results to %s", out_csv)
     df.to_csv(out_csv, index=False)
 
@@ -481,7 +637,7 @@ if __name__ == "__main__":
         action="store_true",
         help="If set, evaluate both complete/indirect attacks with attack-specific tau,q.",
     )
-    parser.add_argument("--nb_trials", type=int, default=int(2e5))
+    parser.add_argument("--nb_trials", type=int, default=None)
     parser.add_argument("--alpha", type=float, default=1e-2)
     parser.add_argument("--c", type=float, default=1e-2)
     parser.add_argument(
@@ -510,8 +666,19 @@ if __name__ == "__main__":
     parser.add_argument("--sim_sigma", type=float, default=1.0)
     parser.add_argument("--sim_mean_shift", type=float, default=0.1)
     parser.add_argument("--sim_rmax_alpha", type=float, default=1e-6)
-    parser.add_argument("--sim_n_train", type=int, default=2000)
-    parser.add_argument("--sim_n_val", type=int, default=2000)
+    parser.add_argument("--sim_n_train", type=int, default=None)
+    parser.add_argument("--sim_n_val", type=int, default=None)
+    parser.add_argument("--N_total", type=int, default=None)
+    parser.add_argument(
+        "--N_ratio",
+        nargs="*",
+        default=None,
+        help=(
+            "Ratio settings for (train, val, final). "
+            "Examples: --N_ratio 0.1,0.1,0.8 0.15,0.15,0.7 "
+            "or --N_ratio '[(0.1,0.1,0.8),(0.15,0.15,0.7)]'"
+        ),
+    )
     parser.add_argument(
         "--analysis",
         type=str,
@@ -522,8 +689,11 @@ if __name__ == "__main__":
 
     args: argparse.Namespace = parser.parse_args()
 
-    cfg = EtaExperimentConfig(
-        nb_trials=args.nb_trials,
+    n_ratio_list: list[tuple[float, float, float]] | None = _parse_n_ratio_args(
+        args.N_ratio
+    )
+    base_cfg = EtaExperimentConfig(
+        nb_trials=int(args.nb_trials) if args.nb_trials is not None else int(2e5),
         alpha=args.alpha,
         c=args.c,
         epsilon_list=tuple(float(x) for x in args.epsilon_list),
@@ -539,16 +709,33 @@ if __name__ == "__main__":
         sim_sigma=args.sim_sigma,
         sim_mean_shift=args.sim_mean_shift,
         sim_rmax_alpha=args.sim_rmax_alpha,
-        sim_n_train=args.sim_n_train,
-        sim_n_val=args.sim_n_val,
+        sim_n_train=int(args.sim_n_train) if args.sim_n_train is not None else 2000,
+        sim_n_val=int(args.sim_n_val) if args.sim_n_val is not None else 2000,
         analysis=args.analysis,
     )
 
     lst_seed = range(args.seed_start, args.seed_end)
+    cfgs: list[EtaExperimentConfig] = _build_ratio_cfgs(
+        base_cfg=base_cfg,
+        n_total=args.N_total,
+        ratios=n_ratio_list,
+        nb_trials_override=args.nb_trials,
+        sim_n_train_override=args.sim_n_train,
+        sim_n_val_override=args.sim_n_val,
+    )
 
-    df: pd.DataFrame = run_eta_model_experiments(cfg=cfg, lst_seed=lst_seed)
-    print("==== Results DataFrame (head) ====")
-    print(df.head(20))
+    for cfg in cfgs:
+        if cfg.n_total is not None:
+            effective_total: int = cfg.nb_trials + cfg.sim_n_train + cfg.sim_n_val
+            if effective_total != int(cfg.n_total):
+                logging.warning(
+                    "Effective total (%s) does not match N_total (%s) because explicit overrides were applied.",
+                    effective_total,
+                    cfg.n_total,
+                )
+        df: pd.DataFrame = run_eta_model_experiments(cfg=cfg, lst_seed=lst_seed)
+        print("==== Results DataFrame (head) ====")
+        print(df.head(20))
 
 # python experiment_eta_model.py \
 #   --evaluate_both_reports \
@@ -565,3 +752,12 @@ if __name__ == "__main__":
 #   --c 0.01 \
 #   --hyperparameter fixed
 
+# time python experiment_eta_model.py \
+#   --evaluate_both_reports \
+#   --N_total 30000 \
+#   --N_ratio 0.1,0.1,0.8 0.15,0.15,0.7 0.2,0.2,0.6 0.25,0.15,0.6 0.15,0.25,0.6 0.3,0.1,0.6 0.1,0.3,0.6 \
+#   --hyperparameter fixed \
+#   --sim_d 20 \
+#   --sim_mean_shift 0.5
+#   --alpha 0.01 \
+#   --c 0.01
