@@ -921,3 +921,26 @@ if __name__ == "__main__":
 #   --sim_mean_shift 0.5
 #   --alpha 0.01 \
 #   --c 0.01
+
+# time python experiment_eta_model.py \
+#   --real_data \
+#   --real_data_path ./SUSY/SUSY.csv \
+#   --real_data_name SUSY \
+#   --evaluate_both_reports \
+#   --hyperparameter fixed \
+#   --selection eps_lower \
+#   --N_total 3000 \
+#   --N_ratio 0.2,0.2,0.6 \
+#   --seed_start 0 \
+#   --seed_end 1
+
+# time python experiment_eta_model.py \
+#   --real_data \
+#   --real_data_path ./SUSY/SUSY.csv \
+#   --real_data_name SUSY \
+#   --evaluate_both_reports \
+#   --hyperparameter fixed \
+#   --N_total all \
+#   --N_ratio 0.2,0.2,0.6 \
+#   --seed_start 0 \
+#   --seed_end 9
