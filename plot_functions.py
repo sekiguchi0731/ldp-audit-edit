@@ -1,13 +1,14 @@
 import pandas as pd
 import numpy as np
 from matplotlib.patches import Rectangle
+from matplotlib.lines import Line2D
 import matplotlib.pyplot as plt
 import matplotlib
 import math
 import argparse
 from pathlib import Path
 from scipy.special import erfinv
-from typing import Literal
+from typing import Literal, Iterable, Sequence, Any
 
 params: dict[str, str] = {'axes.titlesize':'18',
         'xtick.labelsize':'16',
@@ -29,8 +30,8 @@ markers: list[str] = ['s', 'd', 'X', 'o', 'v', '*', '^', '8', 'h', '+', 'P', 'X'
 
 def plot_results_example_audit(df: pd.DataFrame, lst_protocol: list, epsilon: float, k: int) -> None:
     df_eps: pd.DataFrame = df.loc[(df.epsilon == epsilon) & (df.k == k)]
-    dic_eps: dict[str, float] = df_eps.groupby('protocol')['eps_emp'].mean().to_dict()
-    dic_stds: dict[str, float] = df_eps.groupby('protocol')['eps_emp'].std().to_dict()
+    dic_eps: dict[str, float] = df_eps.groupby('protocol')['eps_emp'].mean().to_dict() #type: ignore
+    dic_stds: dict[str, float] = df_eps.groupby('protocol')['eps_emp'].std().to_dict()  # type: ignore
 
     # seed ごとに (GRR_eps + logRmax) を作ってから平均・std を取る
     grr: pd.DataFrame = df_eps[df_eps["protocol"] == "GRR"][["seed", "eps_emp"]]
@@ -975,6 +976,801 @@ def _nice_step_and_max(ymax: float, n_ticks: int) -> tuple[float, float]:
     return step, ymax_nice
 
 
+# === eta_model eps_lower helpers ===
+def load_eps_lower_data(csv_path: str | Path) -> pd.DataFrame:
+    """
+    CSVを読み込み、test_eps_lower の行だけを抽出して返す。
+    """
+    csv_path = Path(csv_path)
+    df = pd.read_csv(csv_path)
+
+    required_cols = {
+        "protocol",
+        "epsilon",
+        "metric",
+        "value",
+        "attack_for_report",
+    }
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
+
+    df = df[df["metric"] == "test_eps_lower"].copy()
+    if df.empty:
+        raise ValueError("No rows with metric == 'test_eps_lower' were found.")
+
+    numeric_cols = [
+        "seed",
+        "epsilon",
+        "value",
+        "sim_mean_shift",
+        "sim_n_train",
+        "sim_n_val",
+        "c",
+        "alpha",
+        "delta",
+    ]
+    return _ensure_float(df, numeric_cols)
+
+
+def _is_indirect_attack(name: str) -> bool:
+    return "indirect" in str(name).lower()
+
+
+def add_epsilon_for_indirect(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    indirect 系 attack_for_report のときだけ
+    plot用の値を value + epsilon にする。
+    """
+    df = df.copy()
+    df["plot_value"] = df["value"]
+    mask = df["attack_for_report"].map(_is_indirect_attack)
+    df.loc[mask, "plot_value"] = df.loc[mask, "value"] + df.loc[mask, "epsilon"]
+    return df
+
+
+def aggregate_eps_lower(
+    df: pd.DataFrame,
+    group_cols: Iterable[str] = ("protocol", "epsilon", "attack_for_report"),
+) -> pd.DataFrame:
+    """
+    同一条件に複数行（例: 複数 seed）がある場合に平均・標準偏差を計算する。
+    indirect の場合は事前に +epsilon 済みの plot_value を集計する。
+    """
+    agg = (
+        df.groupby(list(group_cols), dropna=False)["plot_value"]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+        .rename(columns={"mean": "eps_lower_mean", "std": "eps_lower_std"})
+    )
+    agg["eps_lower_std"] = agg["eps_lower_std"].fillna(0.0)
+    return agg
+
+
+# === true eta attack result helpers ===
+
+def _fmt_short_float_for_path(x: float) -> str:
+    s = f"{float(x):g}"
+    return s.replace("e-0", "e-").replace("e+0", "e+")
+
+
+def _coerce_path_list(
+    paths: str | Path | Sequence[str | Path],
+) -> list[Path]:
+    if isinstance(paths, (str, Path)):
+        out: list[Path] = [Path(paths)]
+    else:
+        out = [Path(p) for p in paths]
+    if len(out) == 0:
+        raise ValueError("At least one path must be provided.")
+    return out
+
+
+def _find_true_eta_csv(
+    mean_shift: float,
+    c_value: float,
+    base_dir: str | Path | Sequence[str | Path] | None = None,
+) -> Path:
+    """
+    真の eta による攻撃結果 CSV を探す。
+    まず shift={mean_shift}_c={c}_decomp.csv を優先し，
+    見つからなければ近い表記ゆれも試す。
+    """
+    results_root = Path(__file__).resolve().parent / "results"
+    search_dirs: list[Path] = []
+    if base_dir is not None:
+        search_dirs.extend(_coerce_path_list(base_dir))
+    search_dirs.extend(
+        [
+            results_root / "20260326v3",
+            results_root / "20260207",
+        ]
+    )
+
+    dedup_dirs: list[Path] = []
+    seen_dirs: set[Path] = set()
+    for p in search_dirs:
+        resolved = p.resolve()
+        if resolved not in seen_dirs:
+            dedup_dirs.append(p)
+            seen_dirs.add(resolved)
+
+    candidates: list[Path] = []
+    for root in dedup_dirs:
+        candidates.extend(
+            [
+                root / f"shift={mean_shift}_c={c_value}_decomp.csv",
+                root / f"shift={_fmt_short_float_for_path(mean_shift)}_c={_fmt_short_float_for_path(c_value)}_decomp.csv",
+                root / f"shift={mean_shift}_c={_fmt_short_float_for_path(c_value)}_decomp.csv",
+                root / f"shift={_fmt_short_float_for_path(mean_shift)}_c={c_value}_decomp.csv",
+            ]
+        )
+    for p in candidates:
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        "True-eta csv was not found. Tried: " + ", ".join(str(p) for p in candidates)
+    )
+
+
+def load_true_eta_summary(
+    mean_shift: float,
+    c_value: float,
+    selection: str | None = None,
+    delta: float | None = None,
+    k: int = 2,
+    base_dir: str | Path | Sequence[str | Path] | None = None,
+) -> pd.DataFrame:
+    """
+    真の eta を用いた監査結果 CSV から，
+    LRT / LRT_indirect の eps_lower を protocol ごとに重ね描きできる形へ整形する。
+    protocol 列は eta_model 側の各サブプロットに重ねるため全 protocol に複製して付与する前提で，
+    ここでは attack_for_report ごとの要約だけ返す。
+    """
+    csv_path = _find_true_eta_csv(
+        mean_shift=float(mean_shift),
+        c_value=float(c_value),
+        base_dir=base_dir,
+    )
+    df_true = pd.read_csv(csv_path)
+    df_true = _ensure_float(
+        df_true,
+        ["seed", "k", "epsilon", "eps_lower", "mean_shift", "c", "delta"],
+    )
+
+    if "protocol" not in df_true.columns:
+        raise ValueError(f"protocol column is missing in true-eta csv: {csv_path}")
+
+    df_true = df_true[df_true["protocol"].isin(["LRT", "LRT_indirect"])].copy()
+
+    if "k" in df_true.columns:
+        df_true = df_true[df_true["k"].astype(float) == float(k)]
+
+    # mean_shift / c は列に無いことがある。
+    # その場合は、すでに _find_true_eta_csv(...) で
+    # shift={mean_shift}, c={c_value} に対応するファイルを選んでいるので
+    # 追加フィルタは行わない。
+    if "mean_shift" in df_true.columns:
+        df_true = df_true[
+            np.isclose(df_true["mean_shift"].astype(float), float(mean_shift))
+        ]
+    elif "sim_mean_shift" in df_true.columns:
+        df_true = df_true[
+            np.isclose(df_true["sim_mean_shift"].astype(float), float(mean_shift))
+        ]
+
+    if "c" in df_true.columns:
+        df_true = df_true[np.isclose(df_true["c"].astype(float), float(c_value))]
+
+    if delta is not None and "delta" in df_true.columns:
+        df_true = df_true[np.isclose(df_true["delta"].astype(float), float(delta))]
+
+    if selection is not None and "selection" in df_true.columns:
+        df_true = df_true[df_true["selection"] == selection]
+
+    if df_true.empty:
+        raise ValueError(
+            f"No rows remained in true-eta csv after filtering: {csv_path}"
+        )
+
+    proto_to_attack = {"LRT": "true_complete", "LRT_indirect": "true_indirect"}
+    df_true = df_true.assign(
+        attack_for_report=df_true["protocol"].map(proto_to_attack),
+        value=df_true["eps_lower"].astype(float),
+    )
+    # true-eta CSV の LRT_indirect は既に (a + epsilon) が保存されているため、
+    # ここでさらに +epsilon すると二重加算になる。
+    df_true["plot_value"] = df_true["value"]
+
+    agg_true = (
+        df_true.groupby(["epsilon", "attack_for_report"], dropna=False)["plot_value"]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+        .rename(columns={"mean": "eps_lower_mean", "std": "eps_lower_std"})
+    )
+    agg_true["eps_lower_std"] = agg_true["eps_lower_std"].fillna(0.0)
+    return agg_true
+
+
+def _load_eta_hat_metric_data(csv_path: str | Path, metric: str = "test_eps_lower") -> pd.DataFrame:
+    csv_path = Path(csv_path)
+    df = pd.read_csv(csv_path)
+
+    required_cols = {"epsilon", "metric", "value", "attack_for_report"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
+
+    df = df[df["metric"] == metric].copy()
+    if df.empty:
+        raise ValueError(f"No rows with metric == '{metric}' were found in {csv_path}.")
+
+    numeric_cols = ["seed", "epsilon", "value"]
+    return _ensure_float(df, numeric_cols)
+
+
+def _find_eta_hat_dimension_csv(
+    *,
+    base_dir: str | Path,
+    mean_shift: float,
+    c_value: float,
+    nb_trials: int,
+    sim_n_train: int,
+    sim_n_val: int,
+    d: int,
+) -> Path:
+    base_dir = Path(base_dir)
+    shift_s = _fmt_short_float_for_path(mean_shift)
+    c_s = _fmt_short_float_for_path(c_value)
+    candidates = [
+        base_dir / f"eta_hat_shift={mean_shift}_c={c_value}_f={nb_trials}_t={sim_n_train}_v={sim_n_val}_d={d}.csv",
+        base_dir / f"eta_hat_shift={shift_s}_c={c_s}_f={nb_trials}_t={sim_n_train}_v={sim_n_val}_d={d}.csv",
+        base_dir / f"eta_hat_shift={mean_shift}_c={c_s}_f={nb_trials}_t={sim_n_train}_v={sim_n_val}_d={d}.csv",
+        base_dir / f"eta_hat_shift={shift_s}_c={c_value}_f={nb_trials}_t={sim_n_train}_v={sim_n_val}_d={d}.csv",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        "eta_hat dimension csv was not found. Tried: " + ", ".join(str(p) for p in candidates)
+    )
+
+
+def plot_eta_hat_dimension_2x2(
+    *,
+    base_dir: str | Path = "results/20260326",
+    outpath: str | Path = "results/fig_eta_hat_dimension_2x2.pdf",
+    mean_shifts: Sequence[float] = (0.1, 0.25, 0.5, 1.0),
+    dims: Sequence[int] = (2, 5, 10, 20),
+    c_value: float = 0.01,
+    nb_trials: int = 20000,
+    sim_n_train: int = 2000,
+    sim_n_val: int = 2000,
+    metric: str = "test_eps_lower",
+    yscale: str = "linear",
+    real_data: bool = False,
+    real_data_dir: str | Path | Sequence[str | Path] | None = None,
+) -> None:
+    """
+    eta_hat の結果CSVを mean_shift ごとに 2x2 パネルで描き，
+    各パネル内で d ごとの complete / indirect の test metric を比較する。
+    indirect は既存プロットと同様に value + epsilon を表示する。
+
+    - パネル: mean_shift
+    - 色: d
+    - 線種: attack（complete / indirect）
+    - real_data=True のときは true eta を赤で重ねる
+    """
+    if len(mean_shifts) != 4:
+        raise ValueError("mean_shifts must contain exactly 4 values for a 2x2 plot.")
+    if len(dims) == 0:
+        raise ValueError("dims must be non-empty.")
+
+    palette: list[str] = [
+        "tab:blue",
+        "tab:green",
+        "tab:purple",
+        "tab:brown",
+        "tab:pink",
+        "tab:cyan",
+        "tab:gray",
+        "tab:olive",
+    ]
+    if len(dims) > len(palette):
+        raise ValueError(f"At most {len(palette)} dims are supported, got {len(dims)}.")
+    color_by_d: dict[int, str] = {int(d): palette[idx] for idx, d in enumerate(dims)}
+    linestyle_by_attack: dict[str, tuple[str, str, str]] = {
+        "complete_LRT_hat": ("-", "v", "complete_lower"),
+        "indirect_LRT_hat": ("--", "v", "decomp_lower"),
+    }
+
+    fig, axes = plt.subplots(2, 2, figsize=(10.8, 7.6), sharey=True)
+    axes = np.atleast_2d(axes)
+
+    for idx, mean_shift in enumerate(mean_shifts):
+        r, ccol = divmod(idx, 2)
+        ax = axes[r, ccol]
+        ax.grid(color="grey", linestyle="dashdot", linewidth=0.5)
+
+        per_d_agg: dict[int, pd.DataFrame] = {}
+        eps_union: set[float] = set()
+        for d in dims:
+            csv_path: Path = _find_eta_hat_dimension_csv(
+                base_dir=base_dir,
+                mean_shift=float(mean_shift),
+                c_value=float(c_value),
+                nb_trials=int(nb_trials),
+                sim_n_train=int(sim_n_train),
+                sim_n_val=int(sim_n_val),
+                d=int(d),
+            )
+            df_metric: pd.DataFrame = _load_eta_hat_metric_data(csv_path=csv_path, metric=metric)
+            df_metric = df_metric.copy()
+            df_metric["plot_value"] = df_metric["value"]
+            mask_indirect: pd.Series[bool] = df_metric["attack_for_report"].map(_is_indirect_attack)
+            df_metric.loc[mask_indirect, "plot_value"] = (
+                df_metric.loc[mask_indirect, "value"] + df_metric.loc[mask_indirect, "epsilon"]
+            )
+            agg: pd.DataFrame = aggregate_eps_lower(
+                df_metric,
+                group_cols=("epsilon", "attack_for_report"),
+            )
+            per_d_agg[int(d)] = agg
+            eps_union.update(float(e) for e in agg["epsilon"].dropna().tolist())
+
+        true_eta_agg: pd.DataFrame | None = None
+        if real_data:
+            true_eta_agg = load_true_eta_summary(
+                mean_shift=float(mean_shift),
+                c_value=float(c_value),
+                k=2,
+                base_dir=real_data_dir,
+            )
+            eps_union.update(float(e) for e in true_eta_agg["epsilon"].dropna().tolist())
+
+        eps_list = np.array(sorted(eps_union), dtype=float)
+        x = np.arange(len(eps_list), dtype=int)
+        eps_to_x: dict[float, int] = {float(e): i for i, e in enumerate(eps_list)}
+
+        ax.plot(
+            x,
+            eps_list,
+            linestyle="dashed",
+            color="black",
+            label="Theoretical $\\varepsilon$",
+            zorder=1,
+        )
+
+        for d in dims:
+            agg = per_d_agg[int(d)]
+            color: str = color_by_d[int(d)]
+            for attack_name, (linestyle, marker, _) in linestyle_by_attack.items():
+                line_df: pd.DataFrame = agg[agg["attack_for_report"] == attack_name].copy()
+                if line_df.empty:
+                    continue
+                line_df = line_df.sort_values("epsilon")
+                xvals: np.ndarray = np.array([eps_to_x[float(e)] for e in line_df["epsilon"]], dtype=int)
+                yvals = line_df["eps_lower_mean"].to_numpy(dtype=float)
+                yerr = line_df["eps_lower_std"].to_numpy(dtype=float)
+
+                ax.plot(
+                    xvals,
+                    yvals,
+                    color=color,
+                    linestyle=linestyle,
+                    linewidth=2.5,
+                    marker=marker,
+                    zorder=10,
+                )
+                ax.errorbar(
+                    xvals,
+                    yvals,
+                    yerr=yerr,
+                    linestyle="None",
+                    capsize=3,
+                    color=color,
+                    zorder=11,
+                )
+
+        if true_eta_agg is not None and not true_eta_agg.empty:
+            for attack_name, linestyle in [
+                ("true_complete", "-"),
+                ("true_indirect", "--"),
+            ]:
+                true_sub: pd.DataFrame = true_eta_agg[
+                    true_eta_agg["attack_for_report"] == attack_name
+                ].copy()
+                if true_sub.empty:
+                    continue
+                true_sub = true_sub.sort_values("epsilon")
+                xvals = np.array([eps_to_x[float(e)] for e in true_sub["epsilon"]], dtype=int)
+                yvals = true_sub["eps_lower_mean"].to_numpy(dtype=float)
+                yerr = true_sub["eps_lower_std"].to_numpy(dtype=float)
+                ax.plot(
+                    xvals,
+                    yvals,
+                    color="red",
+                    linestyle=linestyle,
+                    linewidth=2.8,
+                    marker="s",
+                    zorder=30,
+                )
+                ax.errorbar(
+                    xvals,
+                    yvals,
+                    yerr=yerr,
+                    linestyle="None",
+                    capsize=3,
+                    color="red",
+                    zorder=31,
+                )
+
+        if yscale == "log":
+            ax.set_yscale("log")
+
+        ax.set_title(f"mean_shift = {mean_shift}", fontsize=25)
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(e) for e in eps_list])
+
+        if r == 1:
+            ax.set_xlabel("Theoretical $\\varepsilon$", fontsize=25)
+        else:
+            ax.set_xlabel("")
+            ax.tick_params(axis="x", labelbottom=False)
+
+        if ccol == 0:
+            ax.set_ylabel(r"Estimated $\hat{\varepsilon}_{\mathrm{lower}}$", fontsize=25)
+
+    legend_handles: list[Line2D] = [
+        Line2D([0], [0], color="black", linestyle="dashed", linewidth=2.5, label="Theoretical $\\varepsilon$")
+    ]
+    for d in dims:
+        legend_handles.append(
+            Line2D([0], [0], color=color_by_d[int(d)], linestyle="-", linewidth=2.5, label=f"$d={int(d)}$")
+        )
+    if real_data:
+        legend_handles.append(
+            Line2D([0], [0], color="red", linestyle="-", marker="s", linewidth=2.5, label="true $\\eta$")
+        )
+    for attack_name, (linestyle, marker, label) in linestyle_by_attack.items():
+        legend_handles.append(
+            Line2D(
+                [0],
+                [0],
+                color="black",
+                linestyle=linestyle,
+                marker=marker,
+                linewidth=2.5,
+                label=label,
+            )
+        )
+
+    plt.subplots_adjust(top=0.82)
+    fig.legend(
+        legend_handles,
+        [h.get_label() for h in legend_handles],    # type: ignore
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.02),
+        ncol=4,
+        frameon=True,
+        columnspacing=0.9,
+        handletextpad=0.6,
+        fontsize=18,
+        borderaxespad=0.2,
+    )
+
+    outpath = Path(outpath)
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(outpath, dpi=500, bbox_inches="tight", pad_inches=0.1)
+    plt.show()
+
+
+def _ratio_label_from_row(row: pd.Series) -> str:
+    def _fmt_ratio(x: float) -> str:
+        return f"{float(x):.2f}"
+
+    if {"ratio_train", "ratio_val", "ratio_final"}.issubset(row.index):
+        if pd.notna(row["ratio_train"]) and pd.notna(row["ratio_val"]) and pd.notna(row["ratio_final"]):
+            return (
+                f"{_fmt_ratio(float(row['ratio_train']))}:"
+                f"{_fmt_ratio(float(row['ratio_val']))}:"
+                f"{_fmt_ratio(float(row['ratio_final']))}"
+            )
+
+    if {"sim_n_train", "sim_n_val", "nb_trials", "n_total"}.issubset(row.index) and pd.notna(row["n_total"]):
+        total = float(row["n_total"])
+        if total > 0:
+            return (
+                f"{_fmt_ratio(float(row['sim_n_train']) / total)}:"
+                f"{_fmt_ratio(float(row['sim_n_val']) / total)}:"
+                f"{_fmt_ratio(float(row['nb_trials']) / total)}"
+            )
+    raise ValueError("Could not determine ratio label from row.")
+
+
+def plot_eta_hat_ratio_compare(
+    *,
+    base_dir: str | Path | Sequence[str | Path] = "results/20260326v2",
+    outpath: str | Path = "results/fig_eta_hat_ratio_compare.pdf",
+    sim_mean_shift: float | None = None,
+    sim_d: int | None = None,
+    n_total: int | None = None,
+    c: float | None = None,
+    selection: str | None = None,
+    yscale: str = "linear",
+    real_data: bool = False,
+    real_data_dir: str | Path | Sequence[str | Path] | None = None,
+) -> None:
+    """
+    eta_hat の ratio sweep 結果を左右 2 パネルで描く。
+
+    - 左: complete LRT の test_eps_lower
+    - 右: indirect (decomp) の test_eps_lower + epsilon
+    - 凡例: train:val:final ratio
+    """
+    csv_paths: list[Path] = []
+    base_dirs: list[Path] = _coerce_path_list(base_dir)
+    for root in base_dirs:
+        csv_paths.extend(sorted(root.glob("*.csv")))
+    if len(csv_paths) == 0:
+        raise ValueError(f"No csv files found in {base_dirs}.")
+
+    frames: list[pd.DataFrame] = []
+    for csv_path in csv_paths:
+        df: pd.DataFrame = pd.read_csv(csv_path)
+        required_cols: set[str] = {
+            "epsilon",
+            "metric",
+            "value",
+            "attack_for_report",
+            "sim_mean_shift",
+            "sim_d",
+            "selection",
+        }
+        missing: set[str] = required_cols - set(df.columns)
+        if missing:
+            raise ValueError(f"{csv_path} is missing required columns: {sorted(missing)}")
+        df = df[df["metric"] == "test_eps_lower"].copy()
+        if df.empty:
+            continue
+        frames.append(df)
+
+    if not frames:
+        raise ValueError("No test_eps_lower rows were found in the directory.")
+
+    df_all = pd.concat(frames, ignore_index=True)
+    df_all = _ensure_float(
+        df_all,
+        [
+            "seed",
+            "epsilon",
+            "value",
+            "sim_mean_shift",
+            "sim_d",
+            "nb_trials",
+            "sim_n_train",
+            "sim_n_val",
+            "n_total",
+            "ratio_train",
+            "ratio_val",
+            "ratio_final",
+            "c",
+        ],
+    )
+
+    if sim_mean_shift is not None:
+        df_all = df_all[np.isclose(df_all["sim_mean_shift"], float(sim_mean_shift))]
+    else:
+        shifts: list[float] = sorted(df_all["sim_mean_shift"].dropna().unique().tolist())
+        if len(shifts) != 1:
+            raise ValueError(f"Multiple sim_mean_shift values found: {shifts}. Please specify sim_mean_shift.")
+        sim_mean_shift = float(shifts[0])
+
+    if sim_d is not None:
+        df_all = df_all[df_all["sim_d"].astype(int) == int(sim_d)]
+    else:
+        dims: list[int] = sorted(set(int(v) for v in df_all["sim_d"].dropna().tolist()))
+        if len(dims) != 1:
+            raise ValueError(f"Multiple sim_d values found: {dims}. Please specify sim_d.")
+        sim_d = int(dims[0])
+
+    if n_total is not None and "n_total" in df_all.columns:
+        df_all: pd.DataFrame = df_all[df_all["n_total"].astype(float) == float(n_total)]
+    elif "n_total" in df_all.columns:
+        n_total_values: list[int] = sorted(
+            set(int(v) for v in df_all["n_total"].dropna().astype(float).tolist())
+        )
+        if len(n_total_values) > 1:
+            raise ValueError(
+                "Multiple n_total values remained after loading multiple directories: "
+                f"{n_total_values}. Please specify --n_total."
+            )
+        if len(n_total_values) == 1:
+            n_total = int(n_total_values[0])
+    if c is not None and "c" in df_all.columns:
+        df_all = df_all[np.isclose(df_all["c"].astype(float), float(c))]
+    elif "c" in df_all.columns:
+        c_values: list[float] = sorted(
+            set(float(v) for v in df_all["c"].dropna().astype(float).tolist())
+        )
+        if len(c_values) > 1 and real_data:
+            raise ValueError(f"Multiple c values found: {c_values}. Please specify --c.")
+        if len(c_values) == 1:
+            c = float(c_values[0])
+    if selection is not None and "selection" in df_all.columns:
+        df_all = df_all[df_all["selection"] == selection]
+
+    if df_all.empty:
+        raise ValueError("No rows remained after filtering.")
+
+    df_all = df_all.copy()
+    df_all["ratio_label"] = df_all.apply(_ratio_label_from_row, axis=1)
+
+    ratio_labels: list[str] = sorted(
+        df_all["ratio_label"].dropna().unique().tolist(),
+        key=lambda s: tuple(float(x) for x in s.split(":")),
+    )
+    palette: list[str] = [
+        "tab:blue",
+        "tab:green",
+        "tab:purple",
+        "tab:brown",
+        "tab:pink",
+        "tab:gray",
+        "tab:olive",
+        "tab:orange",
+    ]
+    if len(ratio_labels) > len(palette):
+        raise ValueError(f"At most {len(palette)} ratio settings are supported, got {len(ratio_labels)}.")
+    color_by_ratio: dict[Any, str] = {label: palette[idx] for idx, label in enumerate(ratio_labels)}
+
+    df_complete: pd.DataFrame = df_all[~df_all["attack_for_report"].map(_is_indirect_attack)].copy()
+    df_complete["plot_value"] = df_complete["value"]
+    agg_complete: pd.DataFrame = aggregate_eps_lower(
+        df_complete,
+        group_cols=("ratio_label", "epsilon"),
+    )
+
+    df_indirect: pd.DataFrame = df_all[df_all["attack_for_report"].map(_is_indirect_attack)].copy()
+    df_indirect["plot_value"] = df_indirect["value"] + df_indirect["epsilon"]
+    agg_indirect: pd.DataFrame = aggregate_eps_lower(
+        df_indirect,
+        group_cols=("ratio_label", "epsilon"),
+    )
+
+    true_eta_agg: pd.DataFrame | None = None
+    eps_union: set[float] = set(float(e) for e in df_all["epsilon"].dropna().astype(float).tolist())
+    if real_data:
+        if c is None:
+            raise ValueError("c must be specified or uniquely inferable when --real_data is used.")
+        true_eta_agg = load_true_eta_summary(
+            mean_shift=float(sim_mean_shift),
+            c_value=float(c),
+            k=2,
+            base_dir=real_data_dir,
+        )
+        eps_union.update(float(e) for e in true_eta_agg["epsilon"].dropna().tolist())
+
+    eps_list: np.ndarray = np.array(sorted(eps_union), dtype=float)
+    x = np.arange(len(eps_list), dtype=int)
+    eps_to_x = {float(e): i for i, e in enumerate(eps_list)}
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.4, 3.4), sharex=True, sharey=True)
+    plt.subplots_adjust(wspace=0.25, hspace=0.2)
+    panel_specs: list[tuple[Any, pd.DataFrame, str, str]] = [
+        (axes[0], agg_complete, "complete LRT", "true_complete"),
+        (axes[1], agg_indirect, "decomp + $\\varepsilon$", "true_indirect"),
+    ]
+
+    for ax, agg, title, true_attack_name in panel_specs:
+        ax.grid(color="grey", linestyle="dashdot", linewidth=0.5)
+        ax.plot(
+            x,
+            eps_list,
+            linestyle="dashed",
+            color="black",
+            label="Theoretical $\\varepsilon$",
+            zorder=1,
+        )
+
+        for ratio_label in ratio_labels:
+            sub: pd.DataFrame = agg[agg["ratio_label"] == ratio_label].copy().sort_values("epsilon")
+            if sub.empty:
+                continue
+            xvals: np.ndarray = np.array([eps_to_x[float(e)] for e in sub["epsilon"]], dtype=int)
+            yvals: np.ndarray = sub["eps_lower_mean"].to_numpy(dtype=float)
+            yerr: np.ndarray = sub["eps_lower_std"].to_numpy(dtype=float)
+            color: str = color_by_ratio[ratio_label]
+            ax.plot(
+                xvals,
+                yvals,
+                color=color,
+                linewidth=2.5,
+                marker="o",
+                label=ratio_label,
+                zorder=10,
+            )
+            ax.errorbar(
+                xvals,
+                yvals,
+                yerr=yerr,
+                linestyle="None",
+                capsize=3,
+                color=color,
+                zorder=11,
+            )
+
+        if true_eta_agg is not None and not true_eta_agg.empty:
+            true_sub: pd.DataFrame = true_eta_agg[
+                true_eta_agg["attack_for_report"] == true_attack_name
+            ].copy()
+            if not true_sub.empty:
+                true_sub = true_sub.sort_values("epsilon")
+                xvals = np.array([eps_to_x[float(e)] for e in true_sub["epsilon"]], dtype=int)
+                yvals = true_sub["eps_lower_mean"].to_numpy(dtype=float)
+                yerr = true_sub["eps_lower_std"].to_numpy(dtype=float)
+                ax.plot(
+                    xvals,
+                    yvals,
+                    color="red",
+                    linewidth=2.8,
+                    marker="s",
+                    zorder=30,
+                )
+                ax.errorbar(
+                    xvals,
+                    yvals,
+                    yerr=yerr,
+                    linestyle="None",
+                    capsize=3,
+                    color="red",
+                    zorder=31,
+                )
+
+        if yscale == "log":
+            ax.set_yscale("log")
+
+        ax.set_title(title, fontsize=24)
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(e) for e in eps_list])
+        ax.set_xlabel("Theoretical $\\varepsilon$", fontsize=24)
+
+    axes[0].set_ylabel(r"Estimated $\hat{\varepsilon}_{\mathrm{lower}}$", fontsize=24)
+
+    legend_handles: list[Line2D] = [Line2D([0], [0], color="black", linestyle="dashed", linewidth=2.5, label="Theoretical $\\varepsilon$")]
+    for ratio_label in ratio_labels:
+        legend_handles.append(
+            Line2D([0], [0], color=color_by_ratio[ratio_label], linestyle="-", marker="o", linewidth=2.5, label=ratio_label)
+        )
+    if real_data:
+        legend_handles.append(
+            Line2D([0], [0], color="red", linestyle="-", marker="s", linewidth=2.5, label="true $\\eta$")
+        )
+
+    plt.subplots_adjust(top=0.66)
+    title: str = f"mean_shift = {sim_mean_shift}, d = {sim_d}"
+    if n_total is not None:
+        title += f", N_total = {n_total}"
+    fig.suptitle(title, fontsize=24, y=0.82)
+    fig.legend(
+        legend_handles,
+        [h.get_label() for h in legend_handles],    # type: ignore
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.18),
+        ncol=min(4, len(legend_handles)),
+        frameon=True,
+        columnspacing=0.9,
+        handletextpad=0.6,
+        fontsize=17,
+        borderaxespad=0.2,
+    )
+
+    outpath = Path(outpath)
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(outpath, dpi=500, bbox_inches="tight", pad_inches=0.1)
+    plt.show()
+
+
 def plot_lrt_compare_2x2(
     csv_paths: list[str],
     outpath: str = "results/fig_lrt_compare_2x2.pdf",
@@ -1206,6 +2002,305 @@ def plot_lrt_compare_2x2(
     plt.show()
 
 
+# === eta_model eps_lower plot function ===
+def plot_eta_model_eps_lower_by_protocol(
+    csv_path: str | Path,
+    outpath: str | Path = "results/eta_model_eps_lower_by_protocol.pdf",
+    selection: str | None = None,
+    attack_for_selection: str | None = None,
+    sim_mean_shift: float | None = None,
+    sim_n_train: int | None = None,
+    sim_n_val: int | None = None,
+    c: float | None = None,
+    alpha: float | None = None,
+    delta: float | None = None,
+    ncols: int = 2,
+    yscale: str = "linear",  # "log" or "linear"
+    indirect_csv_path: str | Path | None = None,
+) -> None:
+    """
+    eta_model の結果CSVから protocol ごとに test_eps_lower を描画する。
+    見た目は plot_lrt_compare_2x2 にできるだけ合わせる。
+
+    - 学習した eta の complete 系: csv_path の eps_lower
+    - 学習した eta の indirect 系:
+        * indirect_csv_path が与えられた場合は、そのCSVの eps_lower + epsilon
+        * 与えられない場合は、csv_path 内の indirect 系 eps_lower + epsilon
+    - 真の eta の complete / indirect 系:
+        * results/20260207/shift={mean_shift}_c={c}_decomp.csv から読み込み
+        * いずれも eps_lower を使い、indirect は eps_lower + epsilon を描画
+    """
+    df_complete: pd.DataFrame = load_eps_lower_data(csv_path)
+
+    if selection is not None and "selection" in df_complete.columns:
+        df_complete = df_complete[df_complete["selection"] == selection]
+    if attack_for_selection is not None and "attack_for_selection" in df_complete.columns:
+        df_complete = df_complete[df_complete["attack_for_selection"] == attack_for_selection]
+    if sim_mean_shift is not None and "sim_mean_shift" in df_complete.columns:
+        df_complete = df_complete[
+            np.isclose(df_complete["sim_mean_shift"].astype(float), float(sim_mean_shift))
+        ]
+    if sim_n_train is not None and "sim_n_train" in df_complete.columns:
+        df_complete = df_complete[df_complete["sim_n_train"].astype(float) == float(sim_n_train)]
+    if sim_n_val is not None and "sim_n_val" in df_complete.columns:
+        df_complete = df_complete[df_complete["sim_n_val"].astype(float) == float(sim_n_val)]
+    if c is not None and "c" in df_complete.columns:
+        df_complete = df_complete[np.isclose(df_complete["c"].astype(float), float(c))]
+    if alpha is not None and "alpha" in df_complete.columns:
+        df_complete = df_complete[np.isclose(df_complete["alpha"].astype(float), float(alpha))]
+    if delta is not None and "delta" in df_complete.columns:
+        df_complete = df_complete[np.isclose(df_complete["delta"].astype(float), float(delta))]
+
+    df_list: list[pd.DataFrame] = []
+
+    df_complete_only: pd.DataFrame = df_complete[
+        ~df_complete["attack_for_report"].map(_is_indirect_attack)
+    ].copy()
+    if not df_complete_only.empty:
+        df_complete_only["plot_value"] = df_complete_only["value"]
+        df_list.append(df_complete_only)
+
+    if indirect_csv_path is not None:
+        df_indirect: pd.DataFrame = load_eps_lower_data(indirect_csv_path)
+
+        if selection is not None and "selection" in df_indirect.columns:
+            df_indirect = df_indirect[df_indirect["selection"] == selection]
+        if sim_mean_shift is not None and "sim_mean_shift" in df_indirect.columns:
+            df_indirect = df_indirect[
+                np.isclose(df_indirect["sim_mean_shift"].astype(float), float(sim_mean_shift))
+            ]
+        if sim_n_train is not None and "sim_n_train" in df_indirect.columns:
+            df_indirect = df_indirect[df_indirect["sim_n_train"].astype(float) == float(sim_n_train)]
+        if sim_n_val is not None and "sim_n_val" in df_indirect.columns:
+            df_indirect = df_indirect[df_indirect["sim_n_val"].astype(float) == float(sim_n_val)]
+        if c is not None and "c" in df_indirect.columns:
+            df_indirect = df_indirect[np.isclose(df_indirect["c"].astype(float), float(c))]
+        if alpha is not None and "alpha" in df_indirect.columns:
+            df_indirect = df_indirect[np.isclose(df_indirect["alpha"].astype(float), float(alpha))]
+        if delta is not None and "delta" in df_indirect.columns:
+            df_indirect = df_indirect[np.isclose(df_indirect["delta"].astype(float), float(delta))]
+
+        df_indirect = df_indirect[
+            df_indirect["attack_for_report"].map(_is_indirect_attack)
+        ].copy()
+        if not df_indirect.empty:
+            df_indirect = add_epsilon_for_indirect(df_indirect)
+            df_list.append(df_indirect)
+    else:
+        df_indirect = df_complete[
+            df_complete["attack_for_report"].map(_is_indirect_attack)
+        ].copy()
+        if not df_indirect.empty:
+            df_indirect = add_epsilon_for_indirect(df_indirect)
+            df_list.append(df_indirect)
+
+    if not df_list:
+        raise ValueError("No data remained after filtering.")
+
+    df_plot = pd.concat(df_list, ignore_index=True)
+    agg = aggregate_eps_lower(df_plot)
+
+    true_eta_agg: pd.DataFrame | None = None
+    if sim_mean_shift is not None and c is not None:
+        true_eta_agg = load_true_eta_summary(
+            mean_shift=float(sim_mean_shift),
+            c_value=float(c),
+            selection=selection,
+            delta=delta,
+            k=2,
+        )
+
+    protocols = sorted(agg["protocol"].dropna().unique().tolist())
+    if len(protocols) == 0:
+        raise ValueError("No protocol values found after filtering.")
+
+    nrows = math.ceil(len(protocols) / ncols)
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(10.8, 3.8 * nrows),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+    )
+    axes = np.atleast_2d(axes)
+    axes_flat = axes.flatten()
+
+    for idx, protocol in enumerate(protocols):
+        r, ccol = divmod(idx, ncols)
+        ax = axes[r, ccol]
+        ax.grid(color="grey", linestyle="dashdot", linewidth=0.5)
+
+        sub = agg[agg["protocol"] == protocol].copy()
+        eps_list = np.sort(sub["epsilon"].dropna().unique().astype(float))
+        x = np.arange(len(eps_list), dtype=int)
+        eps_to_x = {float(e): i for i, e in enumerate(eps_list)}
+
+        ax.plot(
+            x,
+            eps_list,
+            linestyle="dashed",
+            color="black",
+            label="Theoretical $\\varepsilon$",
+            zorder=1,
+        )
+
+        attack_names = sorted(sub["attack_for_report"].dropna().unique().tolist())
+        learned_complete_color = "tab:cyan"
+        learned_indirect_color = "mediumorchid"
+        true_complete_color = "tab:blue"
+        true_indirect_color = "tab:purple"
+
+        for attack_name in attack_names:
+            line_df = sub[sub["attack_for_report"] == attack_name].copy()
+            line_df = line_df.sort_values("epsilon")
+            xvals = np.array([eps_to_x[float(e)] for e in line_df["epsilon"]], dtype=int)
+            yvals = line_df["eps_lower_mean"].to_numpy(dtype=float)
+            yerr = line_df["eps_lower_std"].to_numpy(dtype=float)
+
+            if _is_indirect_attack(str(attack_name)):
+                ax.plot(
+                    xvals,
+                    yvals,
+                    color=learned_indirect_color,
+                    linestyle=":",
+                    linewidth=2.5,
+                    marker="v",
+                    label="learned $\\eta$: indirect + $\\varepsilon$",
+                    zorder=21,
+                )
+                ax.errorbar(
+                    xvals,
+                    yvals,
+                    yerr=yerr,
+                    linestyle="None",
+                    capsize=3,
+                    color=learned_indirect_color,
+                    zorder=22,
+                )
+            else:
+                ax.plot(
+                    xvals,
+                    yvals,
+                    marker="v",
+                    linestyle=":",
+                    linewidth=2.5,
+                    color=learned_complete_color,
+                    label="learned $\\eta$: complete",
+                    zorder=10,
+                )
+                ax.errorbar(
+                    xvals,
+                    yvals,
+                    yerr=yerr,
+                    linestyle="None",
+                    capsize=3,
+                    color=learned_complete_color,
+                    zorder=11,
+                )
+
+        if true_eta_agg is not None and not true_eta_agg.empty:
+            true_sub = true_eta_agg.copy().sort_values("epsilon")
+
+            t_complete = true_sub[true_sub["attack_for_report"] == "true_complete"].copy()
+            if not t_complete.empty:
+                xvals = np.array([eps_to_x[float(e)] for e in t_complete["epsilon"]], dtype=int)
+                yvals = t_complete["eps_lower_mean"].to_numpy(dtype=float)
+                yerr = t_complete["eps_lower_std"].to_numpy(dtype=float)
+                ax.plot(
+                    xvals,
+                    yvals,
+                    marker="v",
+                    linestyle="-",
+                    linewidth=2.5,
+                    color=true_complete_color,
+                    label="true $\\eta$: complete",
+                    zorder=30,
+                )
+                ax.errorbar(
+                    xvals,
+                    yvals,
+                    yerr=yerr,
+                    linestyle="None",
+                    capsize=3,
+                    color=true_complete_color,
+                    zorder=31,
+                )
+
+            t_indirect = true_sub[true_sub["attack_for_report"] == "true_indirect"].copy()
+            if not t_indirect.empty:
+                xvals = np.array([eps_to_x[float(e)] for e in t_indirect["epsilon"]], dtype=int)
+                yvals = t_indirect["eps_lower_mean"].to_numpy(dtype=float)
+                yerr = t_indirect["eps_lower_std"].to_numpy(dtype=float)
+                ax.plot(
+                    xvals,
+                    yvals,
+                    color=true_indirect_color,
+                    linestyle="-",
+                    linewidth=2.5,
+                    marker="v",
+                    label="true $\\eta$: indirect + $\\varepsilon$",
+                    zorder=32,
+                )
+                ax.errorbar(
+                    xvals,
+                    yvals,
+                    yerr=yerr,
+                    linestyle="None",
+                    capsize=3,
+                    color=true_indirect_color,
+                    zorder=33,
+                )
+
+        if yscale == "log":
+            ax.set_yscale("log")
+
+        ax.set_title(protocol, fontsize=25)
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(e) for e in eps_list])
+
+        if r == nrows - 1:
+            ax.set_xlabel("Theoretical $\\varepsilon$", fontsize=25)
+        else:
+            ax.set_xlabel("")
+            ax.tick_params(axis="x", labelbottom=False)
+
+        if ccol == 0:
+            ax.set_ylabel(r"Estimated $\hat{\varepsilon}_\mathrm{lower}$", fontsize=25)
+
+    for j in range(len(protocols), len(axes_flat)):
+        axes_flat[j].set_visible(False)
+
+    handles, labels = [], []
+    for ax in axes_flat:
+        if not ax.get_visible():
+            continue
+        h, l = ax.get_legend_handles_labels()
+        for hh, ll in zip(h, l):
+            if ll not in labels:
+                handles.append(hh)
+                labels.append(ll)
+
+    plt.subplots_adjust(top=0.82)
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.02),
+        ncol=min(3, max(1, len(labels))),
+        frameon=True,
+        columnspacing=0.9,
+        handletextpad=0.6,
+        fontsize=20,
+        borderaxespad=0.2,
+    )
+
+    outpath = Path(outpath)
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(outpath, dpi=500, bbox_inches="tight", pad_inches=0.1)
+    plt.show()
+
+
 def plot_results_example_audit_2x2(
     csv_paths: list[str],
     outpath: str = "results/fig_results_summary_audit_2x2.pdf",
@@ -1279,10 +2374,10 @@ def plot_results_example_audit_2x2(
 
         dic_eps: dict[str, float] = (
             df_eps.groupby("protocol")["eps_emp"].mean().to_dict()
-        )
+        ) # type: ignore
         dic_stds: dict[str, float] = (
             df_eps.groupby("protocol")["eps_emp"].std().to_dict()
-        )
+        ) # type: ignore
 
         # seed ごとに (GRR_eps + logRmax) を作ってから平均・std を取る
         grr: pd.DataFrame = df_eps[df_eps["protocol"] == "GRR"][["seed", "eps_emp"]]
@@ -1729,6 +2824,118 @@ def _main_cli() -> None:
         help="Domain size k. If omitted, inferred from first CSV.",
     )
 
+    # ---- subcommand: eta_model_eps_lower（新規） ----
+    p_eta: argparse.ArgumentParser = sub.add_parser("eta_model_eps_lower")
+    p_eta.add_argument("--csv", required=True, help="eta model result csv path.")
+    p_eta.add_argument(
+        "--csv_indirect",
+        default=None,
+        help="Optional indirect-result csv path. If given, indirect is read from this CSV and plotted as eps_lower + epsilon.",
+    )
+    p_eta.add_argument(
+        "--out",
+        default="results/eta_model_eps_lower_by_protocol.pdf",
+        help="Output pdf path.",
+    )
+    p_eta.add_argument("--selection", default=None)
+    p_eta.add_argument("--attack_for_selection", default=None)
+    p_eta.add_argument("--mean_shift", type=float, default=None)
+    p_eta.add_argument("--n_train", type=int, default=None)
+    p_eta.add_argument("--n_val", type=int, default=None)
+    p_eta.add_argument("--c", type=float, default=None)
+    p_eta.add_argument("--alpha", type=float, default=None)
+    p_eta.add_argument("--delta", type=float, default=None)
+    p_eta.add_argument("--ncols", type=int, default=2)
+    p_eta.add_argument(
+        "--yscale",
+        choices=["linear", "log"],
+        default="linear",
+        help="Y-axis scale.",
+    )
+
+    # ---- subcommand: eta_hat_d_2x2 ----
+    p_eta_d: argparse.ArgumentParser = sub.add_parser("eta_hat_d_2x2")
+    p_eta_d.add_argument(
+        "--base_dir",
+        default="results/20260326",
+        help="Directory containing eta_hat_shift=..._d=... csv files.",
+    )
+    p_eta_d.add_argument(
+        "--out",
+        default="results/fig_eta_hat_dimension_2x2.pdf",
+        help="Output pdf path.",
+    )
+    p_eta_d.add_argument(
+        "--mean_shifts",
+        type=float,
+        nargs=4,
+        default=[0.1, 0.25, 0.5, 1.0],
+        help="Exactly four mean_shift values for the 2x2 panels.",
+    )
+    p_eta_d.add_argument(
+        "--dims",
+        type=int,
+        nargs="+",
+        default=[2, 5, 10, 20],
+        help="Dimension values to compare. Colors are assigned in this order.",
+    )
+    p_eta_d.add_argument("--c", type=float, default=0.01)
+    p_eta_d.add_argument("--nb_trials", type=int, default=20000)
+    p_eta_d.add_argument("--n_train", type=int, default=2000)
+    p_eta_d.add_argument("--n_val", type=int, default=2000)
+    p_eta_d.add_argument("--metric", default="test_eps_lower")
+    p_eta_d.add_argument(
+        "--yscale",
+        choices=["linear", "log"],
+        default="linear",
+        help="Y-axis scale.",
+    )
+    p_eta_d.add_argument(
+        "--real_data",
+        action="store_true",
+        help="Overlay true-eta results in red.",
+    )
+    p_eta_d.add_argument(
+        "--real_data_dir",
+        default="results/20260326v3",
+        help="Directory containing true-eta csv files.",
+    )
+
+    # ---- subcommand: eta_hat_ratio_compare ----
+    p_eta_ratio: argparse.ArgumentParser = sub.add_parser("eta_hat_ratio_compare")
+    p_eta_ratio.add_argument(
+        "--base_dir",
+        nargs="+",
+        default=["results/20260326v2"],
+        help="One or more directories containing ratio-sweep eta_hat csv files.",
+    )
+    p_eta_ratio.add_argument(
+        "--out",
+        default="results/fig_eta_hat_ratio_compare.pdf",
+        help="Output pdf path.",
+    )
+    p_eta_ratio.add_argument("--mean_shift", type=float, default=None)
+    p_eta_ratio.add_argument("--sim_d", type=int, default=None)
+    p_eta_ratio.add_argument("--n_total", type=int, default=None)
+    p_eta_ratio.add_argument("--c", type=float, default=None)
+    p_eta_ratio.add_argument("--selection", default=None)
+    p_eta_ratio.add_argument(
+        "--real_data",
+        action="store_true",
+        help="Overlay true-eta results in red.",
+    )
+    p_eta_ratio.add_argument(
+        "--real_data_dir",
+        default="results/20260326v3",
+        help="Directory containing true-eta csv files.",
+    )
+    p_eta_ratio.add_argument(
+        "--yscale",
+        choices=["linear", "log"],
+        default="linear",
+        help="Y-axis scale.",
+    )
+
     # ---- subcommand: N_c_sweep（新規） ----
     p3 = sub.add_parser("N_c_sweep")
     p3.add_argument(
@@ -1796,6 +3003,50 @@ def _main_cli() -> None:
             k=args.k,
             lst_protocol=["GRR", "LRT"],
         )
+    elif args.cmd == "eta_model_eps_lower":
+        plot_eta_model_eps_lower_by_protocol(
+            csv_path=args.csv,
+            outpath=args.out,
+            selection=args.selection,
+            attack_for_selection=args.attack_for_selection,
+            sim_mean_shift=args.mean_shift,
+            sim_n_train=args.n_train,
+            sim_n_val=args.n_val,
+            c=args.c,
+            alpha=args.alpha,
+            delta=args.delta,
+            ncols=int(args.ncols),
+            yscale=args.yscale,
+            indirect_csv_path=args.csv_indirect,
+        )
+    elif args.cmd == "eta_hat_d_2x2":
+        plot_eta_hat_dimension_2x2(
+            base_dir=args.base_dir,
+            outpath=args.out,
+            mean_shifts=list(args.mean_shifts),
+            dims=list(args.dims),
+            c_value=float(args.c),
+            nb_trials=int(args.nb_trials),
+            sim_n_train=int(args.n_train),
+            sim_n_val=int(args.n_val),
+            metric=str(args.metric),
+            yscale=args.yscale,
+            real_data=bool(args.real_data),
+            real_data_dir=args.real_data_dir,
+        )
+    elif args.cmd == "eta_hat_ratio_compare":
+        plot_eta_hat_ratio_compare(
+            base_dir=args.base_dir,
+            outpath=args.out,
+            sim_mean_shift=args.mean_shift,
+            sim_d=args.sim_d,
+            n_total=args.n_total,
+            c=args.c,
+            selection=args.selection,
+            yscale=args.yscale,
+            real_data=bool(args.real_data),
+            real_data_dir=args.real_data_dir,
+        )
     elif args.cmd == "N_c_sweep":
         plot_N_c_sweep_2x2(
             csv_N=args.csv_N,
@@ -1843,3 +3094,80 @@ if __name__ == "__main__":
 #   --csv_c ./results/20260116/c_sweep_N=500000_eps=1.0_k=2_seeds=5.csv \
 #   --out results/fig_N_c_sweep_2x2.pdf \
 #   --shifts 0.1 0.5
+
+# python plot_functions.py eta_model_eps_lower \
+#   --csv results/eta_model_results_shift=0.1_c=1e-2_eps=0.25_10_complete_select_reduced.csv \
+#   --csv_indirect results/eta_model_results_shift=0.1_c=1e-2_eps=0.25_10_decomp_select_reduced.csv \
+
+# python plot_functions.py eta_hat_ratio_compare \
+#   --base_dir ./results/20260326v2 ./results/20260327 ./results/20260327v2 \
+#   --out ./results/fig_eta_hat_ratio_compare.pdf \
+#   --mean_shift 0.5 \
+#   --sim_d 20 \
+#   --n_total 30000 \
+#   --real_data \
+#   --real_data_dir ./results/20260326v3
+#   --out results/eta_model_eps_lower_by_protocol.pdf \
+#   --selection eps_lower \
+#   --attack_for_selection complete_LRT_hat \
+#   --mean_shift 0.1 \
+#   --n_train 400 \
+#   --n_val 200 \
+#   --c 0.01 \
+#   --alpha 0.01 \
+#   --delta 0.0 \
+#   --yscale linear
+
+# python plot_functions.py eta_model_eps_lower \
+#   --csv results/eta_model_results_shift=0.1_c=1e-2_eps=0.25_10_complete_select_reduced_sel=complete_LRT_hat_rep=indirect_LRT_hat.csv \
+#   --out results/eta_model_eps_lower_by_protocol.pdf \
+#   --selection eps_lower \
+#   --attack_for_selection complete_LRT_hat \
+#   --mean_shift 0.1 \
+#   --n_train 2000 \
+#   --n_val 500 \
+#   --c 0.01 \
+#   --alpha 0.01 \
+#   --delta 0.0 \
+#   --yscale linear
+
+#  python plot_functions.py eta_model_eps_lower \
+#   --csv results/eta_model_results_shift=0.1_c=1e-2_eps=0.25_10_sel=complete_LRT_hat_rep=indirect_LRT_hat.csv \
+#   --out results/eta_model_eps_lower_by_protocol_shift0.1_c1e-2.pdf \
+#   --selection eps_lower \
+#   --attack_for_selection complete_LRT_hat \
+#   --mean_shift 0.1 \
+#   --n_train 2000 \
+#   --n_val 2000 \
+#   --c 0.01 \
+#   --alpha 0.01 \
+#   --delta 0.0 \
+#   --yscale linear
+
+# python plot_functions.py eta_hat_d_2x2 \
+#   --base_dir /Users/sekiguchihinata/lab/ldp-audit-edit/results/20260326 \
+#   --out /Users/sekiguchihinata/lab/ldp-audit-edit/results/fig_eta_hat_dimension_2x2.pdf \
+#   --real_data \
+#   --real_data_dir /Users/sekiguchihinata/lab/ldp-audit-edit/results/20260326v3
+
+# python plot_functions.py eta_hat_ratio_compare \
+#   --base_dir ./results/20260326v2 ./results/20260327 ./results/20260327v2 \
+#   --out ./results/fig_eta_hat_ratio_compare.pdf \
+#   --mean_shift 0.5 \
+#   --sim_d 20 \
+#   --n_total 30000 \
+#   --real_data \
+#   --real_data_dir ./results/20260326v3
+
+# python /Users/sekiguchihinata/lab/ldp-audit-edit/plot_functions.py \
+#   eta_hat_ratio_compare \
+#   --base_dir \
+#     /Users/sekiguchihinata/lab/ldp-audit-edit/results/20260326v2 \
+#     /Users/sekiguchihinata/lab/ldp-audit-edit/results/20260327 \
+#     /Users/sekiguchihinata/lab/ldp-audit-edit/results/20260327v2 \
+#   --mean_shift 0.5 \
+#   --sim_d 20 \
+#   --n_total 30000 \
+#   --real_data \                                                                        
+#   --real_data_dir /Users/sekiguchihinata/lab/ldp-audit-edit/results/20260326v3 \
+#   --out /Users/sekiguchihinata/lab/ldp-audit-edit/results/fig_eta_hat_ratio_compare_real.pdf
