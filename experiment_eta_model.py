@@ -276,9 +276,11 @@ def load_susy_real_data_split(
     seed: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     n_total = int(n_train + n_val + n_final)
-    total_rows = _count_csv_rows(csv_path)
+    total_rows: int = _count_csv_rows(csv_path)
+    logging.info(f"[load_susy] total_rows={total_rows}, requested={n_total}")
+
     if n_total == total_rows:
-        sampled = pd.read_csv(csv_path, header=None, dtype=np.float32).to_numpy(dtype=np.float32, copy=False)
+        sampled: np.ndarray = pd.read_csv(csv_path, header=None, dtype=np.float32).to_numpy(dtype=np.float32, copy=False)
     else:
         sampled = _reservoir_sample_csv_rows(csv_path=csv_path, n_rows=n_total, seed=seed)
 
