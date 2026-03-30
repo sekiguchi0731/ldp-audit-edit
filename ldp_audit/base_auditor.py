@@ -81,6 +81,11 @@ class LDPAuditor:
         spec: MixtureSpec | None = None,
         c: float = 1e-6,
         dynamic_nb_trials: bool = True,
+        sim_hat: bool = True,
+        real_val_X: np.ndarray | None = None,
+        real_val_y: np.ndarray | None = None,
+        real_final_X: np.ndarray | None = None,
+        real_final_y: np.ndarray | None = None,
     ) -> None:
         """
         Initializes the LDPAuditor with the specified parameters.
@@ -144,6 +149,22 @@ class LDPAuditor:
         self.rmax_alpha: float = rmax_alpha
         self.spec: MixtureSpec | None = spec
         self.c: float = float(c)
+        self.sim_hat: bool = bool(sim_hat)
+        self.real_val_X: np.ndarray | None = real_val_X
+        self.real_val_y: np.ndarray | None = real_val_y
+        self.real_final_X: np.ndarray | None = real_final_X
+        self.real_final_y: np.ndarray | None = real_final_y
+
+        if not self.sim_hat:
+            if (
+                self.real_val_X is None
+                or self.real_val_y is None
+                or self.real_final_X is None
+                or self.real_final_y is None
+            ):
+                raise ValueError(
+                    "When sim_hat=False, real_val_X/real_val_y/real_final_X/real_final_y must be provided."
+                )
 
         self.B: float = set_B_from_quantile(self.spec, alpha=self.rmax_alpha)
         print("Set B:", self.B)
@@ -384,17 +405,56 @@ class LDPAuditor:
     ############# LRT 監査用の関数群 #############
 
     ##### eta 学習モデルをつかう #####
-    def _sample_p_theta_hat(self, y_input: int, n: int, rng: np.random.Generator, eta_model) -> np.ndarray:
+    def _sample_x_given_y_for_eta_hat(
+        self,
+        *,
+        y_input: int,
+        n: int,
+        rng: np.random.Generator,
+        sample_source: Literal["val", "final"] = "final",
+    ) -> np.ndarray:
+        if self.sim_hat:
+            if self.spec is None:
+                raise ValueError("spec must be set.")
+            X: np.ndarray = sample_x_given_y_truncated(
+                n=n,
+                spec=self.spec,
+                y=y_input,
+                rng=rng,
+                B=self.B,
+            )
+            return self.project_l2_ball(X, B=self.B)
+
+        X_pool: np.ndarray | None = self.real_val_X if sample_source == "val" else self.real_final_X
+        y_pool: np.ndarray | None = self.real_val_y if sample_source == "val" else self.real_final_y
+        assert X_pool is not None and y_pool is not None
+
+        idx_all: np.ndarray = np.flatnonzero(y_pool == y_input)
+        if idx_all.size == 0:
+            raise ValueError(
+                f"No real-data samples with y={y_input} were found in {sample_source} pool."
+            )
+        chosen: np.ndarray = rng.choice(idx_all, size=int(n), replace=True)
+        return np.asarray(X_pool[chosen], dtype=float)
+
+    def _sample_p_theta_hat(
+        self,
+        y_input: int,
+        n: int,
+        rng: np.random.Generator,
+        eta_model,
+        sample_source: Literal["val", "final"] = "final",
+    ) -> np.ndarray:
         """
         完全LRT用：eta(x) を学習モデルで推定する版
         Pr[Y=1 | x, \tilde y] スコアの ndarray を返す
         """
-        if self.spec is None:
-            raise ValueError("spec must be set.")
-        
-        # 事後分布から X をサンプリング
-        X: np.ndarray = sample_x_given_y_truncated(n=n, spec=self.spec, y=y_input, rng=rng, B=self.B)
-        X = self.project_l2_ball(X, B=self.B)
+        X: np.ndarray = self._sample_x_given_y_for_eta_hat(
+            y_input=y_input,
+            n=n,
+            rng=rng,
+            sample_source=sample_source,
+        )
 
         eta_hat: np.ndarray = predict_eta(eta_model, X)
         ytilde: np.ndarray = grr_sample_binary(y=y_input, n=n, epsilon=float(self.epsilon), rng=rng)
@@ -406,14 +466,23 @@ class LDPAuditor:
         return p
 
 
-    def _sample_score_x_hat(self, y_input: int, n: int, rng: np.random.Generator, eta_model) -> np.ndarray:
+    def _sample_score_x_hat(
+        self,
+        y_input: int,
+        n: int,
+        rng: np.random.Generator,
+        eta_model,
+        sample_source: Literal["val", "final"] = "final",
+    ) -> np.ndarray:
         """
         X-only（Decomposition）用：score_x = logit(eta_hat(x))
         """
-        if self.spec is None:
-            raise ValueError("spec must be set.")
-        X: np.ndarray = sample_x_given_y_truncated(n=n, spec=self.spec, y=y_input, rng=rng, B=self.B)
-        X = self.project_l2_ball(X, B=self.B)
+        X: np.ndarray = self._sample_x_given_y_for_eta_hat(
+            y_input=y_input,
+            n=n,
+            rng=rng,
+            sample_source=sample_source,
+        )
 
         eta_hat: np.ndarray = predict_eta(eta_model, X)
         score_x = np.log(eta_hat) - np.log(1.0 - eta_hat)
@@ -428,16 +497,40 @@ class LDPAuditor:
         attack: Literal["complete_LRT_hat", "tilde y=y_alt only LRT_hat", "indirect_LRT_hat"],
         y_alt: int = 1,
         y_null: int = 0,
+        sample_source: Literal["val", "final"] = "final",
+        n_alt_eval: int | None = None,
+        n_null_eval: int | None = None,
     ) -> dict:
         """
         学習etaモデルを使う版の評価
         TP, FP, tpr_hat, fpr_hat, eps_emp, eps_ci などを入れた dict を返す
+        sample_source: "val" or "final" -- 
+        etaモデルの学習に使ったデータから（データ数で）サンプリングするか、最終評価用のデータからサンプリングするか
         """
-        if self.spec is None:
+        if self.sim_hat and self.spec is None:
             raise ValueError("spec must be set for evaluation.")
 
-        # 試行回数 for 評価 （Guideline1 に従う）
-        N_final = int(self.nb_trials)
+        def _resolve_eval_counts() -> tuple[int, int]:
+            if n_alt_eval is not None and n_null_eval is not None:
+                n_alt: int = int(n_alt_eval)
+                n_null: int = int(n_null_eval)
+            elif not self.sim_hat:
+                y_pool: np.ndarray | None = self.real_val_y if sample_source == "val" else self.real_final_y
+                assert y_pool is not None
+                n_alt = int(np.sum(y_pool == y_alt))
+                n_null = int(np.sum(y_pool == y_null))
+            else:
+                n_alt = int(self.nb_trials)
+                n_null = int(self.nb_trials)
+
+            if min(n_alt, n_null) <= 0:
+                raise ValueError(
+                    f"Evaluation counts must be positive. Got n_alt={n_alt}, n_null={n_null}, "
+                    f"sample_source={sample_source}."
+                )
+            return n_alt, n_null
+
+        n_alt, n_null = _resolve_eval_counts()
 
         def _sample_attack_outputs(p: np.ndarray) -> int:
             # S^{tau,q}(.) を実際にサンプルして「1 を出した回数」を返す
@@ -452,32 +545,68 @@ class LDPAuditor:
             return int(out.sum())
 
         if attack == "complete_LRT_hat":
-            p1: np.ndarray = self._sample_p_theta_hat(y_alt, N_final, rng, eta_model=eta_model)
-            p0: np.ndarray = self._sample_p_theta_hat(y_null, N_final, rng, eta_model=eta_model)
+            p1: np.ndarray = self._sample_p_theta_hat(
+                y_alt,
+                n_alt,
+                rng,
+                eta_model=eta_model,
+                sample_source=sample_source,
+            )
+            p0: np.ndarray = self._sample_p_theta_hat(
+                y_null,
+                n_null,
+                rng,
+                eta_model=eta_model,
+                sample_source=sample_source,
+            )
 
         elif attack == "tilde y=y_alt only LRT_hat":        # 無視で良い
-            score1 = self._sample_score_x_hat(y_alt, N_final, rng, eta_model=eta_model)
-            score0 = self._sample_score_x_hat(y_null, N_final, rng, eta_model=eta_model)
-
-            ytilde1 = grr_sample_binary(
-                y=y_alt, n=N_final, epsilon=float(self.epsilon), rng=rng
+            score1 = self._sample_score_x_hat(
+                y_alt,
+                n_alt,
+                rng,
+                eta_model=eta_model,
+                sample_source=sample_source,
             )
-            ytilde0 = grr_sample_binary(
-                y=y_null, n=N_final, epsilon=float(self.epsilon), rng=rng
+            score0 = self._sample_score_x_hat(
+                y_null,
+                n_null,
+                rng,
+                eta_model=eta_model,
+                sample_source=sample_source,
             )
 
-            p1 = np.zeros(N_final, dtype=np.float64)
-            p0 = np.zeros(N_final, dtype=np.float64)
+            ytilde1: np.ndarray = grr_sample_binary(
+                y=y_alt, n=n_alt, epsilon=float(self.epsilon), rng=rng
+            )
+            ytilde0: np.ndarray = grr_sample_binary(
+                y=y_null, n=n_null, epsilon=float(self.epsilon), rng=rng
+            )
 
-            m1 = ytilde1 == y_alt
-            m0 = ytilde0 == y_alt
+            p1: np.ndarray = np.zeros(n_alt, dtype=np.float64)
+            p0: np.ndarray = np.zeros(n_null, dtype=np.float64)
+
+            m1: np.ndarray = ytilde1 == y_alt
+            m0: np.ndarray = ytilde0 == y_alt
 
             p1[m1] = 1.0 / (1.0 + np.exp(-score1[m1]))
             p0[m0] = 1.0 / (1.0 + np.exp(-score0[m0]))
 
         elif attack == "indirect_LRT_hat":
-            score1: np.ndarray = self._sample_score_x_hat(y_alt, N_final, rng, eta_model=eta_model)
-            score0: np.ndarray = self._sample_score_x_hat(y_null, N_final, rng, eta_model=eta_model)
+            score1: np.ndarray = self._sample_score_x_hat(
+                y_alt,
+                n_alt,
+                rng,
+                eta_model=eta_model,
+                sample_source=sample_source,
+            )
+            score0: np.ndarray = self._sample_score_x_hat(
+                y_null,
+                n_null,
+                rng,
+                eta_model=eta_model,
+                sample_source=sample_source,
+            )
             p1 = 1.0 / (1.0 + np.exp(-score1))
             p0 = 1.0 / (1.0 + np.exp(-score0))
 
@@ -487,11 +616,11 @@ class LDPAuditor:
         TP: int = _sample_attack_outputs(p1)
         FP: int = _sample_attack_outputs(p0)
 
-        tpr_hat: float = TP / N_final
-        fpr_hat: float = FP / N_final
+        tpr_hat: float = TP / n_alt
+        fpr_hat: float = FP / n_null
 
-        tpr_lo, tpr_hi = proportion_confint(TP, N_final, alpha=self.alpha, method="beta")
-        fpr_lo, fpr_hi = proportion_confint(FP, N_final, alpha=self.alpha, method="beta")
+        tpr_lo, tpr_hi = proportion_confint(TP, n_alt, alpha=self.alpha, method="beta")
+        fpr_lo, fpr_hi = proportion_confint(FP, n_null, alpha=self.alpha, method="beta")
 
         # DP-Sniper の c-power: ln_{>=c}(x)=ln(max(c, x)) を使う
         # FPR が validation/test で c を割り込んだ場合でも下駄履きで安定化する
@@ -503,7 +632,9 @@ class LDPAuditor:
         return {
             "TP": TP,
             "FP": FP,
-            "N_final": N_final,
+            "N_final": int(self.nb_trials),
+            "N_alt_eval": n_alt,
+            "N_null_eval": n_null,
             "tpr_hat": float(tpr_hat),
             "fpr_hat": float(fpr_hat),
             "tpr_ci": (float(tpr_lo), float(tpr_hi)),       # type: ignore
@@ -544,6 +675,7 @@ class LDPAuditor:
                     n=int(np.sum(y_val == y_null)),
                     rng=rng_tau,
                     eta_model=model,
+                    sample_source="val",
                 )
             else:
                 raise ValueError(f"Unknown attack_for_selection: {attack_for_selection}")
@@ -565,6 +697,9 @@ class LDPAuditor:
                 ),
                 y_alt=y_alt,
                 y_null=y_null,
+                sample_source="val",
+                n_alt_eval=int(np.sum(y_val == y_alt)),
+                n_null_eval=int(np.sum(y_val == y_null)),
             )
 
             if selection == "eps_emp":
@@ -710,6 +845,7 @@ class LDPAuditor:
                         n=int(np.sum(y_val == y_null)),
                         rng=rng_tau,
                         eta_model=model,
+                        sample_source="val",
                     )
                 else:
                     scores_null = predict_eta(model, X_val[y_val == y_null])
@@ -728,6 +864,7 @@ class LDPAuditor:
                     attack=attack_name,
                     y_alt=y_alt,
                     y_null=y_null,
+                    sample_source="final",
                 )
                 tests_by_attack[str(attack_name)] = res_test
 

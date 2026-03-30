@@ -7,10 +7,13 @@ import ast
 import json
 import logging
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Iterable, Literal, Sequence, cast
 
 import numpy as np
+from numpy.random import Generator
 import pandas as pd
+from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
 from ldp_audit.base_auditor import LDPAuditor
@@ -63,9 +66,37 @@ class EtaExperimentConfig:
     ratio_train: float | None = None
     ratio_val: float | None = None
     ratio_final: float | None = None
+    real_data_name: str | None = None
 
     # output
     analysis: str = "eta_model_comparison"
+
+
+def _count_csv_rows(csv_path: str, chunksize: int = 1 << 20) -> int:
+    total: int = 0
+    with open(csv_path, "rb") as f:
+        while True:
+            chunk = f.read(chunksize)
+            if not chunk:
+                break
+            total += chunk.count(b"\n")
+    return total
+
+
+def _parse_n_total_arg(
+    raw_value: str | None,
+    *,
+    real_data: bool,
+    real_data_path: str,
+) -> int | None:
+    if raw_value is None:
+        return None
+    text = str(raw_value).strip().lower()
+    if text == "all":
+        if not real_data:
+            raise ValueError("--N_total all is supported only with --real_data.")
+        return _count_csv_rows(real_data_path)
+    return int(raw_value)
 
 
 def _validate_ratio_triplet(ratio: Sequence[float]) -> tuple[float, float, float]:
@@ -204,6 +235,73 @@ def _build_ratio_cfgs(
     return cfgs
 
 
+def _reservoir_sample_csv_rows(
+    *,
+    csv_path: str,
+    n_rows: int,
+    seed: int,
+    chunksize: int = 100_000,
+) -> np.ndarray:
+    if n_rows <= 0:
+        raise ValueError(f"n_rows must be positive, got {n_rows}.")
+
+    rng: Generator = np.random.default_rng(seed)
+    reservoir: np.ndarray | None = None
+    seen: int = 0
+
+    for chunk in pd.read_csv(csv_path, header=None, chunksize=chunksize, dtype=np.float32):
+        arr = chunk.to_numpy(dtype=np.float32, copy=False)
+        if reservoir is None:
+            reservoir = np.empty((n_rows, arr.shape[1]), dtype=np.float32)
+        for row in arr:
+            seen += 1
+            if seen <= n_rows:
+                reservoir[seen - 1] = row
+            else:
+                j = int(rng.integers(seen))
+                if j < n_rows:
+                    reservoir[j] = row
+
+    if reservoir is None or seen < n_rows:
+        raise ValueError(f"Requested n_rows={n_rows}, but csv only had {seen} rows.")
+    return reservoir
+
+
+def load_susy_real_data_split(
+    *,
+    csv_path: str,
+    n_train: int,
+    n_val: int,
+    n_final: int,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    n_total = int(n_train + n_val + n_final)
+    total_rows = _count_csv_rows(csv_path)
+    if n_total == total_rows:
+        sampled = pd.read_csv(csv_path, header=None, dtype=np.float32).to_numpy(dtype=np.float32, copy=False)
+    else:
+        sampled = _reservoir_sample_csv_rows(csv_path=csv_path, n_rows=n_total, seed=seed)
+
+    y: np.ndarray = sampled[:, 0].astype(np.int64)
+    X: np.ndarray = sampled[:, 1:].astype(np.float32)
+
+    X_train, X_rest, y_train, y_rest = train_test_split(
+        X,
+        y,
+        train_size=int(n_train),
+        stratify=y,
+        random_state=int(seed),
+    )
+    X_val, X_final, y_val, y_final = train_test_split(
+        X_rest,
+        y_rest,
+        train_size=int(n_val),
+        stratify=y_rest,
+        random_state=int(seed) + 1,
+    )
+    return X_train, y_train, X_val, y_val, X_final, y_final
+
+
 def _append_metric(
     rows: dict[str, list],
     *,
@@ -269,6 +367,8 @@ def run_eta_model_experiments(
     y_train: np.ndarray | None = None,
     X_val: np.ndarray | None = None,
     y_val: np.ndarray | None = None,
+    X_final: np.ndarray | None = None,
+    y_final: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """
     Run eta-model (logreg/svm/rf/mlp) comparison and save results as CSV.
@@ -281,7 +381,7 @@ def run_eta_model_experiments(
 
     Notes:
         - In simulation mode, it internally generates attackers' auxiliary labeled data.
-        - In real-data mode, pass X_train,y_train,X_val,y_val. (labels must be 0/1)
+        - In real-data mode, pass X_train,y_train,X_val,y_val,X_final,y_final. (labels must be 0/1)
     """
     logging.info("=== run_eta_model_experiments ===")
     report_attacks: tuple[Literal["indirect_LRT_hat", "complete_LRT_hat"], ...] = (
@@ -357,15 +457,17 @@ def run_eta_model_experiments(
             sim_n_val=cfg.sim_n_val,
         )
     else:
+        if X_val is None or y_val is None or X_final is None or y_final is None:
+            raise ValueError("Real-data mode requires X_val/y_val/X_final/y_final.")
         d_real = int(X_train.shape[1])
         # dummy spec (won't be used for train/val generation in real mode)
         spec = MixtureSpec(num_classes=2, d=d_real, sigma=1.0, mean_shift=1.0)
         sim_meta = dict(
-            sim_d=None,
+            sim_d=d_real,
             sim_sigma=None,
             sim_mean_shift=None,
-            sim_n_train=None,
-            sim_n_val=None,
+            sim_n_train=X_train.shape[0],
+            sim_n_val=X_val.shape[0],
         )
 
     sim_d_row: int = int(sim_meta["sim_d"] if sim_meta["sim_d"] is not None else -1)
@@ -424,6 +526,11 @@ def run_eta_model_experiments(
         c=cfg.c,
         spec=spec,
         dynamic_nb_trials=False,
+        sim_hat=(X_train is None),
+        real_val_X=X_val,
+        real_val_y=y_val,
+        real_final_X=X_final,
+        real_final_y=y_final,
     )
 
     # In real-data mode, B/logRmax from spec is meaningless; but it won't break if you don't call those paths.
@@ -616,8 +723,19 @@ def run_eta_model_experiments(
 
     df = pd.DataFrame(rows)
 
-    out_csv: str = f"results/20260326v2/eta_hat_shift={cfg.sim_mean_shift}_c={cfg.c}_f={cfg.nb_trials}_t={cfg.sim_n_train}_v={cfg.sim_n_val}_d={cfg.sim_d}.csv"
+    if X_train is None:
+        out_csv: str = (
+            f"results/20260330/eta_hat_shift={cfg.sim_mean_shift}_c={cfg.c}"
+            f"_f={cfg.nb_trials}_t={cfg.sim_n_train}_v={cfg.sim_n_val}_d={cfg.sim_d}.csv"
+        )
+    else:
+        data_name: str = cfg.real_data_name or "real"
+        out_csv = (
+            f"results/20260330/eta_hat_{data_name}_c={cfg.c}"
+            f"_f={cfg.nb_trials}_t={X_train.shape[0]}_v={X_val.shape[0]}_d={X_train.shape[1]}.csv" # type: ignore
+        )
     logging.info("Saving eta-model results to %s", out_csv)
+    Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False)
 
     logging.info("Done. df.shape=%s", df.shape)
@@ -668,7 +786,15 @@ if __name__ == "__main__":
     parser.add_argument("--sim_rmax_alpha", type=float, default=1e-6)
     parser.add_argument("--sim_n_train", type=int, default=None)
     parser.add_argument("--sim_n_val", type=int, default=None)
-    parser.add_argument("--N_total", type=int, default=None)
+    parser.add_argument("--real_data", action="store_true")
+    parser.add_argument(
+        "--real_data_path",
+        type=str,
+        default="./SUSY/SUSY.csv",
+    )
+    parser.add_argument("--real_data_name", type=str, default="SUSY")
+    parser.add_argument("--real_data_seed", type=int, default=0)
+    parser.add_argument("--N_total", type=str, default=None)
     parser.add_argument(
         "--N_ratio",
         nargs="*",
@@ -689,9 +815,21 @@ if __name__ == "__main__":
 
     args: argparse.Namespace = parser.parse_args()
 
-    n_ratio_list: list[tuple[float, float, float]] | None = _parse_n_ratio_args(
-        args.N_ratio
+    if (
+        args.N_total is not None
+        and str(args.N_total).strip().lower() == "all"
+        and any(v is not None for v in (args.nb_trials, args.sim_n_train, args.sim_n_val))
+    ):
+        raise ValueError(
+            "When --N_total all is used, do not also specify --nb_trials/--sim_n_train/--sim_n_val."
+        )
+
+    n_total_value: int | None = _parse_n_total_arg(
+        args.N_total,
+        real_data=bool(args.real_data),
+        real_data_path=str(args.real_data_path),
     )
+    n_ratio_list: list[tuple[float, float, float]] | None = _parse_n_ratio_args(args.N_ratio)
     base_cfg = EtaExperimentConfig(
         nb_trials=int(args.nb_trials) if args.nb_trials is not None else int(2e5),
         alpha=args.alpha,
@@ -711,13 +849,14 @@ if __name__ == "__main__":
         sim_rmax_alpha=args.sim_rmax_alpha,
         sim_n_train=int(args.sim_n_train) if args.sim_n_train is not None else 2000,
         sim_n_val=int(args.sim_n_val) if args.sim_n_val is not None else 2000,
+        real_data_name=args.real_data_name if args.real_data else None,
         analysis=args.analysis,
     )
 
     lst_seed = range(args.seed_start, args.seed_end)
     cfgs: list[EtaExperimentConfig] = _build_ratio_cfgs(
         base_cfg=base_cfg,
-        n_total=args.N_total,
+        n_total=n_total_value,
         ratios=n_ratio_list,
         nb_trials_override=args.nb_trials,
         sim_n_train_override=args.sim_n_train,
@@ -733,7 +872,26 @@ if __name__ == "__main__":
                     effective_total,
                     cfg.n_total,
                 )
-        df: pd.DataFrame = run_eta_model_experiments(cfg=cfg, lst_seed=lst_seed)
+        if args.real_data:
+            X_train, y_train, X_val, y_val, X_final, y_final = load_susy_real_data_split(
+                csv_path=args.real_data_path,
+                n_train=int(cfg.sim_n_train),
+                n_val=int(cfg.sim_n_val),
+                n_final=int(cfg.nb_trials),
+                seed=int(args.real_data_seed),
+            )
+            df: pd.DataFrame = run_eta_model_experiments(
+                cfg=cfg,
+                lst_seed=lst_seed,
+                X_train=X_train,
+                y_train=y_train,
+                X_val=X_val,
+                y_val=y_val,
+                X_final=X_final,
+                y_final=y_final,
+            )
+        else:
+            df = run_eta_model_experiments(cfg=cfg, lst_seed=lst_seed)
         print("==== Results DataFrame (head) ====")
         print(df.head(20))
 
