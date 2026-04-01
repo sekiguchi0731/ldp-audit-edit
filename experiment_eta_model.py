@@ -8,7 +8,7 @@ import json
 import logging
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable, Literal, Sequence, cast
+from typing import Iterable, Literal, Sequence, Callable, cast
 
 import numpy as np
 from numpy.random import Generator
@@ -19,9 +19,11 @@ from tqdm import tqdm
 from ldp_audit.base_auditor import LDPAuditor
 from ldp_audit.eta_models import (
     EtaModelConfig,
+    fit_and_select_eta_model,
     get_default_eta_model_configs,
     get_fixed_logreg_eta_model_configs,
     get_reduced_eta_model_configs,
+    predict_eta,
 )
 from ldp_audit.simulation import MixtureSpec
 
@@ -67,16 +69,18 @@ class EtaExperimentConfig:
     ratio_val: float | None = None
     ratio_final: float | None = None
     real_data_name: str | None = None
+    collect_score_distribution: bool = False
 
     # output
     analysis: str = "eta_model_comparison"
+    output_root: str = "./results"
 
 
 def _count_csv_rows(csv_path: str, chunksize: int = 1 << 20) -> int:
     total: int = 0
     with open(csv_path, "rb") as f:
         while True:
-            chunk = f.read(chunksize)
+            chunk: bytes = f.read(chunksize)
             if not chunk:
                 break
             total += chunk.count(b"\n")
@@ -91,7 +95,7 @@ def _parse_n_total_arg(
 ) -> int | None:
     if raw_value is None:
         return None
-    text = str(raw_value).strip().lower()
+    text: str = str(raw_value).strip().lower()
     if text == "all":
         if not real_data:
             raise ValueError("--N_total all is supported only with --real_data.")
@@ -145,6 +149,87 @@ def _parse_n_ratio_args(
 
 def _format_ratio_for_path(x: float) -> str:
     return f"{float(x):.3f}".rstrip("0").rstrip(".")
+
+
+def _sanitize_for_path(text: str) -> str:
+    safe_chars: set[str] = {"-", "_", ".", "="}
+    return "".join(ch if ch.isalnum() or ch in safe_chars else "_" for ch in text)
+
+
+def _save_score_distribution_csv(
+    *,
+    score_values: np.ndarray,
+    class_values: np.ndarray,
+    output_dir: Path,
+    data_name: str,
+    protocol: str,
+) -> Path:
+    score_values = np.asarray(score_values, dtype=np.float64)
+    class_values = np.asarray(class_values, dtype=np.int64)
+    if score_values.shape[0] != class_values.shape[0]:
+        raise ValueError(
+            "score_values and class_values must contain the same number of records. "
+            f"Got {score_values.shape[0]} and {class_values.shape[0]}."
+        )
+
+    out_path: Path = output_dir / (
+        f"{_sanitize_for_path(protocol)}_{_sanitize_for_path(data_name)}_distribution.csv"
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {
+            "score": score_values,
+            "class": class_values,
+        }
+    ).to_csv(out_path, index=False)
+    return out_path
+
+
+def _save_indirect_score_distributions(
+    *,
+    eta_model_cfgs: Sequence[EtaModelConfig],
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    X_final: np.ndarray,
+    y_final: np.ndarray,
+    output_dir: Path,
+    data_name: str,
+    selection: Literal["eps_lower", "eps_emp", "tpr_at_fpr"],
+    auditor: LDPAuditor,
+) -> None:
+    score_fn: Callable[..., float] = auditor._select_score_fn_for_eta_model(
+        X_val=X_val,
+        y_val=y_val,
+        selection=selection,
+        rng_seed_for_val=0,
+        attack_for_selection="indirect_LRT_hat",
+    )
+
+    # For each eta model family, fit+select best hyperparameters using the validation set, 
+    # then save the distribution of eta_hat(x) on the final test set as CSV.
+    for model_cfg in eta_model_cfgs:
+        best: dict[str, object] = fit_and_select_eta_model(
+            cfg=model_cfg,
+            X_train=X_train,
+            y_train=y_train,
+            X_val=X_val,
+            y_val=y_val,
+            seed=0,
+            score_fn=score_fn,
+        )
+        model: object = best["model"]
+        if model is None:
+            raise RuntimeError(f"Failed to fit model for protocol={model_cfg.name}.")
+        score_csv_path: Path = _save_score_distribution_csv(
+            score_values=predict_eta(model, X_final),  # type: ignore[arg-type]
+            class_values=y_final,
+            output_dir=output_dir,
+            data_name=data_name,
+            protocol=f"ETA_{model_cfg.name}",
+        )
+        logging.info("Saved score distribution to %s", score_csv_path)
 
 
 def _resolve_count_plan(
@@ -477,6 +562,9 @@ def run_eta_model_experiments(
     sim_mean_shift_row: float | None = sim_meta["sim_mean_shift"]
     sim_n_train_row: int = int(sim_meta["sim_n_train"] if sim_meta["sim_n_train"] is not None else -1)
     sim_n_val_row: int = int(sim_meta["sim_n_val"] if sim_meta["sim_n_val"] is not None else -1)
+    output_root: Path = Path(cfg.output_root)
+    dist_output_dir: Path = output_root / "score_distributions"
+    score_dist_data_name: str = cfg.real_data_name or "real"
 
     def append_row(
         *,
@@ -537,6 +625,29 @@ def run_eta_model_experiments(
 
     # In real-data mode, B/logRmax from spec is meaningless; but it won't break if you don't call those paths.
     # If you later refactor auditor to allow spec=None for real mode, you can simplify.
+
+    if (
+        cfg.collect_score_distribution
+        and X_train is not None
+        and y_train is not None
+        and X_val is not None
+        and y_val is not None
+        and X_final is not None
+        and y_final is not None
+    ):
+        _save_indirect_score_distributions(
+            eta_model_cfgs=eta_model_cfgs,
+            X_train=X_train,
+            y_train=y_train,
+            X_val=X_val,
+            y_val=y_val,
+            X_final=X_final,
+            y_final=y_final,
+            output_dir=dist_output_dir,
+            data_name=score_dist_data_name,
+            selection=cfg.selection,
+            auditor=auditor,
+        )
 
     # ---------- run seeds x eps ----------
     for seed in tqdm(list(lst_seed), desc="ETA model comparison (per seed, per epsilon)"):
@@ -727,13 +838,13 @@ def run_eta_model_experiments(
 
     if X_train is None:
         out_csv: str = (
-            f"results/20260330/eta_hat_shift={cfg.sim_mean_shift}_c={cfg.c}"
+            f"{output_root}/eta_hat_shift={cfg.sim_mean_shift}_c={cfg.c}"
             f"_f={cfg.nb_trials}_t={cfg.sim_n_train}_v={cfg.sim_n_val}_d={cfg.sim_d}.csv"
         )
     else:
         data_name: str = cfg.real_data_name or "real"
         out_csv = (
-            f"results/20260330/eta_hat_{data_name}_c={cfg.c}"
+            f"{output_root}/eta_hat_{data_name}_c={cfg.c}"
             f"_f={cfg.nb_trials}_t={X_train.shape[0]}_v={X_val.shape[0]}_d={X_train.shape[1]}.csv" # type: ignore
         )
     logging.info("Saving eta-model results to %s", out_csv)
@@ -796,6 +907,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--real_data_name", type=str, default="SUSY")
     parser.add_argument("--real_data_seed", type=int, default=0)
+    parser.add_argument(
+        "--score_dist",
+        action="store_true",
+        help=(
+            "If set, save indirect eta_hat(x) distributions as score/class CSVs. "
+            "This is only enabled when --real_data is also set."
+        ),
+    )
     parser.add_argument("--N_total", type=str, default=None)
     parser.add_argument(
         "--N_ratio",
@@ -814,6 +933,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--seed_start", type=int, default=0)
     parser.add_argument("--seed_end", type=int, default=5)
+    parser.add_argument(
+        "--output_root",
+        type=str,
+        default="./results",
+        help="Root directory to save outputs.",
+    )
 
     args: argparse.Namespace = parser.parse_args()
 
@@ -832,6 +957,9 @@ if __name__ == "__main__":
         real_data_path=str(args.real_data_path),
     )
     n_ratio_list: list[tuple[float, float, float]] | None = _parse_n_ratio_args(args.N_ratio)
+    collect_score_distribution: bool = bool(args.score_dist and args.real_data)
+    if args.score_dist and not args.real_data:
+        logging.info("Ignoring --score_dist because score distributions are saved only with --real_data.")
     base_cfg = EtaExperimentConfig(
         nb_trials=int(args.nb_trials) if args.nb_trials is not None else int(2e5),
         alpha=args.alpha,
@@ -852,7 +980,9 @@ if __name__ == "__main__":
         sim_n_train=int(args.sim_n_train) if args.sim_n_train is not None else 2000,
         sim_n_val=int(args.sim_n_val) if args.sim_n_val is not None else 2000,
         real_data_name=args.real_data_name if args.real_data else None,
+        collect_score_distribution=collect_score_distribution,
         analysis=args.analysis,
+        output_root=args.output_root,
     )
 
     lst_seed = range(args.seed_start, args.seed_end)
@@ -938,9 +1068,11 @@ if __name__ == "__main__":
 #   --real_data \
 #   --real_data_path ./SUSY/SUSY.csv \
 #   --real_data_name SUSY \
+#   --output_root ./results/20260401 \
 #   --evaluate_both_reports \
 #   --hyperparameter fixed \
 #   --N_total all \
 #   --N_ratio 0.2,0.2,0.6 \
 #   --seed_start 0 \
-#   --seed_end 9
+#   --seed_end 9 \
+#   --score_dist
