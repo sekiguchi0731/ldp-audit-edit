@@ -23,7 +23,7 @@ from numba.core.errors import NumbaExperimentalFeatureWarning
 # Import UE protocols from pure-ldp package (https://github.com/Samuel-Maddock/pure-LDP)
 from pure_ldp.frequency_oracles.unary_encoding import UEClient
 from scipy.optimize import OptimizeResult, minimize_scalar
-from scipy.special import erfinv
+from scipy.special import erfinv, expit
 from statsmodels.stats.proportion import proportion_confint
 
 from ldp_audit.eta_models import EtaModelConfig
@@ -86,6 +86,7 @@ class LDPAuditor:
         real_val_y: np.ndarray | None = None,
         real_final_X: np.ndarray | None = None,
         real_final_y: np.ndarray | None = None,
+        eta_class_prior: tuple[float, float] | None = None,
     ) -> None:
         """
         Initializes the LDPAuditor with the specified parameters.
@@ -154,6 +155,9 @@ class LDPAuditor:
         self.real_val_y: np.ndarray | None = real_val_y
         self.real_final_X: np.ndarray | None = real_final_X
         self.real_final_y: np.ndarray | None = real_final_y
+        self.eta_class_prior: tuple[float, float] | None = self._validate_eta_class_prior(
+            eta_class_prior
+        )
 
         if not self.sim_hat:
             if (
@@ -245,6 +249,8 @@ class LDPAuditor:
             if delim:
                 nested_params[key][sub_key] = value
             else:
+                if key == "eta_class_prior":
+                    value: tuple[float, float] | None = self._validate_eta_class_prior(value)
                 setattr(self, key, value)
                 valid_params[key] = value
 
@@ -278,7 +284,47 @@ class LDPAuditor:
             'logRmax_eff': self.logRmax_eff,
             'c': self.c,
             'dynamic_nb_trials': self.dynamic_nb_trials,
+            'eta_class_prior': self.eta_class_prior,
         }
+
+    @staticmethod
+    def _validate_eta_class_prior(
+        class_prior: tuple[float, float] | None,
+    ) -> tuple[float, float] | None:
+        """Validate class prior as (P[Y=0], P[Y=1])."""
+        if class_prior is None:
+            return None
+        if len(class_prior) != 2:
+            raise ValueError("eta_class_prior must be a tuple (P[Y=0], P[Y=1]).")
+        prior_0, prior_1 = (float(class_prior[0]), float(class_prior[1]))
+        if prior_0 <= 0.0 or prior_1 <= 0.0:
+            raise ValueError("eta_class_prior entries must be positive.")
+        total: float = prior_0 + prior_1
+        if not np.isfinite(total) or total <= 0.0:
+            raise ValueError("eta_class_prior must be finite and positive.")
+        return (prior_0 / total, prior_1 / total)
+
+    def _log_eta_prior_correction(self) -> float:
+        """
+        Convert posterior odds eta/(1-eta) to class-conditional density ratio.
+
+        eta_hat(x) estimates P(Y=1|X=x), so
+            eta/(1-eta) = p(x|Y=1) P(Y=1) / (p(x|Y=0) P(Y=0)).
+        The DP-Sniper score compares p(z|Y=1) / p(z|Y=0), hence the correction
+        factor P(Y=0) / P(Y=1).  Simulation data in this repo has equal priors,
+        so the default correction is zero.
+        """
+        if self.eta_class_prior is None:
+            return 0.0
+        prior_0, prior_1 = self.eta_class_prior
+        return float(np.log(prior_0) - np.log(prior_1))
+
+    def _eta_to_x_lr_log_score(self, eta: np.ndarray) -> np.ndarray:
+        eta = np.clip(np.asarray(eta, dtype=np.float64), 1e-15, 1.0 - 1e-15)
+        return np.log(eta) - np.log1p(-eta) + self._log_eta_prior_correction()
+
+    def _eta_to_x_lr_prob(self, eta: np.ndarray) -> np.ndarray:
+        return expit(self._eta_to_x_lr_log_score(eta))
 
     def _apply_dynamic_nb_trials(self) -> None:
         """
@@ -447,7 +493,7 @@ class LDPAuditor:
     ) -> np.ndarray:
         """
         完全LRT用：eta(x) を学習モデルで推定する版
-        Pr[Y=1 | x, \tilde y] スコアの ndarray を返す
+        p((x,\tilde y)|Y=1) / p((x,\tilde y)|Y=0) の単調変換を返す
         """
         X: np.ndarray = self._sample_x_given_y_for_eta_hat(
             y_input=y_input,
@@ -459,10 +505,17 @@ class LDPAuditor:
         eta_hat: np.ndarray = predict_eta(eta_model, X)
         ytilde: np.ndarray = grr_sample_binary(y=y_input, n=n, epsilon=float(self.epsilon), rng=rng)
 
-        # LRT の対数スコア Λ(x,\tilde y) を計算
-        llr: np.ndarray = attack_lrt_scores(ytilde, eta_hat, float(self.epsilon))
-        # sigmoid = つまり Pr[Y=1|x,\tilde y]
-        p = 1.0 / (1.0 + np.exp(-llr))
+        # LRT の対数スコアを計算する。
+        # attack_lrt_scores は eta posterior odds を使うため、実データの不均衡 prior は
+        # p(z|Y=1)/p(z|Y=0) に直す補正 log(P[Y=0]/P[Y=1]) を足す。
+        # model の predect は P(Y=1|x,\tilde y)/p(Y=0|x, \tilde y)　だから、
+        # そこから LRT で使う値である p(x, \tilde y|Y=1)/p(x, \tilde y|Y=0) に変換する場合、
+        # Pr[Y=0]/Pr[Y=1] をかける（つまり対数での加算をする）必要がある
+        llr: np.ndarray = (
+            attack_lrt_scores(ytilde, eta_hat, float(self.epsilon))
+            + self._log_eta_prior_correction()
+        )
+        p = expit(llr)
         return p
 
 
@@ -475,7 +528,8 @@ class LDPAuditor:
         sample_source: Literal["val", "final"] = "final",
     ) -> np.ndarray:
         """
-        X-only（Decomposition）用：score_x = logit(eta_hat(x))
+        X-only（Decomposition）用：
+        score_x = logit(eta_hat(x)) + log(P[Y=0]/P[Y=1])
         """
         X: np.ndarray = self._sample_x_given_y_for_eta_hat(
             y_input=y_input,
@@ -485,7 +539,7 @@ class LDPAuditor:
         )
 
         eta_hat: np.ndarray = predict_eta(eta_model, X)
-        score_x = np.log(eta_hat) - np.log(1.0 - eta_hat)
+        score_x = self._eta_to_x_lr_log_score(eta_hat)
         return score_x
 
     def evaluate_eps_with_dp_sniper_cp_hat(
@@ -589,8 +643,8 @@ class LDPAuditor:
             m1: np.ndarray = ytilde1 == y_alt
             m0: np.ndarray = ytilde0 == y_alt
 
-            p1[m1] = 1.0 / (1.0 + np.exp(-score1[m1]))
-            p0[m0] = 1.0 / (1.0 + np.exp(-score0[m0]))
+            p1[m1] = expit(score1[m1])
+            p0[m0] = expit(score0[m0])
 
         elif attack == "indirect_LRT_hat":
             score1: np.ndarray = self._sample_score_x_hat(
@@ -607,8 +661,8 @@ class LDPAuditor:
                 eta_model=eta_model,
                 sample_source=sample_source,
             )
-            p1 = 1.0 / (1.0 + np.exp(-score1))
-            p0 = 1.0 / (1.0 + np.exp(-score0))
+            p1 = expit(score1)
+            p0 = expit(score0)
 
         else:
             raise ValueError("Unknown attack type")
@@ -667,7 +721,9 @@ class LDPAuditor:
         def score_fn(model) -> float:
             # attack_for_selection に応じて null 側スコアから tau,q を作る
             if attack_for_selection == "indirect_LRT_hat":
-                scores_null: np.ndarray = predict_eta(model, X_val[y_val == y_null])
+                scores_null: np.ndarray = self._eta_to_x_lr_prob(
+                    predict_eta(model, X_val[y_val == y_null])
+                )
             elif attack_for_selection == "complete_LRT_hat":
                 rng_tau: Generator = np.random.default_rng(rng_seed_for_val + 12345)
                 scores_null = self._sample_p_theta_hat(
@@ -837,7 +893,9 @@ class LDPAuditor:
                 }
 
                 if attack_name == "indirect_LRT_hat":
-                    scores_null: np.ndarray = predict_eta(model, X_val[y_val == y_null])
+                    scores_null: np.ndarray = self._eta_to_x_lr_prob(
+                        predict_eta(model, X_val[y_val == y_null])
+                    )
                 elif attack_name == "complete_LRT_hat":
                     rng_tau: Generator = np.random.default_rng(int(rng.integers(1 << 31)))
                     scores_null = self._sample_p_theta_hat(
@@ -882,9 +940,15 @@ class LDPAuditor:
                 "report_attacks": [str(a) for a in report_attack_list],
             }
 
+        prior_0, prior_1 = self.eta_class_prior if self.eta_class_prior is not None else (0.5, 0.5)
         return {
             "selection": selection,
             "report_attacks": [str(a) for a in report_attack_list],
+            "eta_class_prior": {
+                "prior_0": float(prior_0),
+                "prior_1": float(prior_1),
+                "log_prior_0_over_prior_1": self._log_eta_prior_correction(),
+            },
             "results": report,
         }
 

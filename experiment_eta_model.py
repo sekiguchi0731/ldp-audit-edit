@@ -185,6 +185,20 @@ def _save_score_distribution_csv(
     return out_path
 
 
+def _estimate_binary_class_prior(y: np.ndarray) -> tuple[float, float]:
+    """Estimate (P[Y=0], P[Y=1]) from labels used to fit eta_hat."""
+    y_arr: np.ndarray = np.asarray(y, dtype=np.int64)
+    n0 = int(np.sum(y_arr == 0))
+    n1 = int(np.sum(y_arr == 1))
+    total: int = n0 + n1
+    if n0 <= 0 or n1 <= 0 or total <= 0:
+        raise ValueError(
+            "eta prior correction requires both labels 0 and 1 in y_train. "
+            f"Got n0={n0}, n1={n1}."
+        )
+    return (float(n0 / total), float(n1 / total))
+
+
 def _save_indirect_score_distributions(
     *,
     eta_model_cfgs: Sequence[EtaModelConfig],
@@ -207,8 +221,8 @@ def _save_indirect_score_distributions(
         attack_for_selection="indirect_LRT_hat",
     )
 
-    # For each eta model family, fit+select best hyperparameters using the validation set, 
-    # then save the distribution of eta_hat(x) on the final test set as CSV.
+    # For each eta model family, fit+select best hyperparameters using the validation set,
+    # then save the prior-corrected indirect score distribution on the final test set.
     for model_cfg in eta_model_cfgs:
         best: dict[str, object] = fit_and_select_eta_model(
             cfg=model_cfg,
@@ -223,7 +237,7 @@ def _save_indirect_score_distributions(
         if model is None:
             raise RuntimeError(f"Failed to fit model for protocol={model_cfg.name}.")
         score_csv_path: Path = _save_score_distribution_csv(
-            score_values=predict_eta(model, X_final),  # type: ignore[arg-type]
+            score_values=auditor._eta_to_x_lr_prob(predict_eta(model, X_final)),  
             class_values=y_final,
             output_dir=output_dir,
             data_name=data_name,
@@ -536,6 +550,7 @@ def run_eta_model_experiments(
             sigma=cfg.sim_sigma,
             mean_shift=cfg.sim_mean_shift,
         )
+        eta_class_prior: tuple[float, float] = (0.5, 0.5)
         sim_meta: dict[str, float | None] = dict(
             sim_d=cfg.sim_d,
             sim_sigma=cfg.sim_sigma,
@@ -549,6 +564,13 @@ def run_eta_model_experiments(
         d_real = int(X_train.shape[1])
         # dummy spec (won't be used for train/val generation in real mode)
         spec = MixtureSpec(num_classes=2, d=d_real, sigma=1.0, mean_shift=1.0)
+        eta_class_prior = _estimate_binary_class_prior(y_train) if y_train is not None else (0.5, 0.5)
+        logging.info(
+            "Using eta prior correction from y_train: P[Y=0]=%.6g, P[Y=1]=%.6g, log(pi0/pi1)=%.6g",
+            eta_class_prior[0],
+            eta_class_prior[1],
+            float(np.log(eta_class_prior[0]) - np.log(eta_class_prior[1])),
+        )
         sim_meta = dict(
             sim_d=d_real,
             sim_sigma=None,
@@ -621,6 +643,7 @@ def run_eta_model_experiments(
         real_val_y=y_val,
         real_final_X=X_final,
         real_final_y=y_final,
+        eta_class_prior=eta_class_prior,
     )
 
     # In real-data mode, B/logRmax from spec is meaningless; but it won't break if you don't call those paths.
@@ -673,6 +696,7 @@ def run_eta_model_experiments(
                 y_alt=cfg.y_alt,
                 y_null=cfg.y_null,
             )
+            prior_info: dict[str, float] = cast(dict[str, float], out.get("eta_class_prior", {}))
 
             for model_name, info in out["results"].items():
                 protocol: str = f"ETA_{model_name}"
@@ -717,6 +741,21 @@ def run_eta_model_experiments(
                 tau_q_by_attack: dict[str, dict[str, float]] = info.get("tau_q_by_attack", {})
                 if tau_q_by_attack:
                     for attack_name, tau_q in tau_q_by_attack.items():
+                        for metric_name, prior_key in (
+                            ("eta_prior_y0", "pi0"),
+                            ("eta_prior_y1", "pi1"),
+                            ("eta_log_prior_correction", "log_pi0_over_pi1"),
+                        ):
+                            append_row(
+                                seed=int(seed),
+                                protocol=protocol,
+                                epsilon=epsilon,
+                                attack_for_selection=str(attack_name),
+                                metric=metric_name,
+                                value=float(prior_info[prior_key]) if prior_key in prior_info else None,
+                                params_json=params_json_by_attack.get(str(attack_name)),
+                                attack_for_report=str(attack_name),
+                            )
                         append_row(
                             seed=int(seed),
                             protocol=protocol,
