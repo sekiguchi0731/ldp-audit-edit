@@ -942,7 +942,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--real_data_path",
         type=str,
-        default="./SUSY/SUSY.csv",
+        default="./data/SUSY/SUSY.csv",
     )
     parser.add_argument("--real_data_name", type=str, default="SUSY")
     parser.add_argument("--real_data_seed", type=int, default=0)
@@ -1093,7 +1093,7 @@ if __name__ == "__main__":
 
 # time python experiment_eta_model.py \
 #   --real_data \
-#   --real_data_path ./SUSY/SUSY.csv \
+#   --real_data_path ./data/SUSY/SUSY.csv \
 #   --real_data_name SUSY \
 #   --evaluate_both_reports \
 #   --hyperparameter fixed \
@@ -1105,7 +1105,7 @@ if __name__ == "__main__":
 
 # time python experiment_eta_model.py \
 #   --real_data \
-#   --real_data_path ./SUSY/SUSY.csv \
+#   --real_data_path ./data/SUSY/SUSY.csv \
 #   --real_data_name SUSY \
 #   --output_root ./results/20260401 \
 #   --evaluate_both_reports \
@@ -1115,3 +1115,16 @@ if __name__ == "__main__":
 #   --seed_start 0 \
 #   --seed_end 9 \
 #   --score_dist
+
+# python experiment_eta_model.py \
+#   --real_data \
+#   --real_data_path ./data/criteo_search/criteo_search_numeric.csv \
+#   --real_data_name CriteoSearch \
+#   --output_root ./results/20260401 \
+#   --evaluate_both_reports \
+#   --hyperparameter fixed \
+#   --N_total 3597294 \
+#   --N_ratio 0.2,0.2,0.6 \
+#   --seed_start 0 \
+#   --seed_end 3
+
