@@ -4,6 +4,7 @@ from collections import defaultdict
 from typing import Any, Literal, Self, Callable, Sequence, cast
 
 from matplotlib.pylab import Generator
+import pandas as pd
 from sklearn.pipeline import Pipeline
 import numpy as np
 import psutil
@@ -12,23 +13,12 @@ import psutil
 import ray
 import xxhash
 
-# Import LDP protocols (by default from multi-freq-ldpy package -- https://github.com/hharcolezi/multi-freq-ldpy)
-from multi_freq_ldpy.pure_frequency_oracles.GRR import GRR_Client
-from multi_freq_ldpy.pure_frequency_oracles.HE import HE_Client
-from multi_freq_ldpy.pure_frequency_oracles.LH import LH_Client
-from multi_freq_ldpy.pure_frequency_oracles.SS import SS_Client
-from multi_freq_ldpy.pure_frequency_oracles.UE import UE_Client
-from numba.core.errors import NumbaExperimentalFeatureWarning
-
-# Import UE protocols from pure-ldp package (https://github.com/Samuel-Maddock/pure-LDP)
-from pure_ldp.frequency_oracles.unary_encoding import UEClient
 from scipy.optimize import OptimizeResult, minimize_scalar
 from scipy.special import erfinv, expit
 from statsmodels.stats.proportion import proportion_confint
 
 from ldp_audit.eta_models import EtaModelConfig
 
-from .approximate_ldp import AGRR_Client, ALH_Client, ASUE_Client, GM_Client, find_scale
 from .attacks import (
     attack_gm,
     attack_lh,
@@ -58,6 +48,51 @@ from .simulation import (
 from .utils import find_tresh, setting_seed
 
 warnings.simplefilter("ignore")
+
+FeatureMatrix = np.ndarray | pd.DataFrame
+
+try:
+    from numba.core.errors import NumbaExperimentalFeatureWarning
+except Exception:
+    class NumbaExperimentalFeatureWarning(Warning):
+        pass
+
+
+def _get_grr_client():
+    from multi_freq_ldpy.pure_frequency_oracles.GRR import GRR_Client
+    return GRR_Client
+
+
+def _get_he_client():
+    from multi_freq_ldpy.pure_frequency_oracles.HE import HE_Client
+    return HE_Client
+
+
+def _get_lh_client():
+    from multi_freq_ldpy.pure_frequency_oracles.LH import LH_Client
+    return LH_Client
+
+
+def _get_ss_client():
+    from multi_freq_ldpy.pure_frequency_oracles.SS import SS_Client
+    return SS_Client
+
+
+def _get_ue_client():
+    from multi_freq_ldpy.pure_frequency_oracles.UE import UE_Client
+    return UE_Client
+
+
+def _get_pure_ldp_ue_client():
+    from pure_ldp.frequency_oracles.unary_encoding import UEClient
+    return UEClient
+
+
+def _get_approximate_ldp_symbols():
+    from .approximate_ldp import AGRR_Client, ALH_Client, ASUE_Client, GM_Client, find_scale
+    return AGRR_Client, ALH_Client, ASUE_Client, GM_Client, find_scale
+
+
 class LDPAuditor:
     """
     The LDPAuditor class is designed to audit various Local Differential Privacy (LDP) protocols.
@@ -82,9 +117,9 @@ class LDPAuditor:
         c: float = 1e-6,
         dynamic_nb_trials: bool = True,
         sim_hat: bool = True,
-        real_val_X: np.ndarray | None = None,
+        real_val_X: FeatureMatrix | None = None,
         real_val_y: np.ndarray | None = None,
-        real_final_X: np.ndarray | None = None,
+        real_final_X: FeatureMatrix | None = None,
         real_final_y: np.ndarray | None = None,
         eta_class_prior: tuple[float, float] | None = None,
     ) -> None:
@@ -151,9 +186,9 @@ class LDPAuditor:
         self.spec: MixtureSpec | None = spec
         self.c: float = float(c)
         self.sim_hat: bool = bool(sim_hat)
-        self.real_val_X: np.ndarray | None = real_val_X
+        self.real_val_X: FeatureMatrix | None = real_val_X
         self.real_val_y: np.ndarray | None = real_val_y
-        self.real_final_X: np.ndarray | None = real_final_X
+        self.real_final_X: FeatureMatrix | None = real_final_X
         self.real_final_y: np.ndarray | None = real_final_y
         self.eta_class_prior: tuple[float, float] | None = self._validate_eta_class_prior(
             eta_class_prior
@@ -442,6 +477,7 @@ class LDPAuditor:
 
         setting_seed(random_state)
         np.random.seed(random_state)
+        GRR_Client = _get_grr_client()
 
         count = 0
         for _ in range(trials):            
@@ -451,6 +487,17 @@ class LDPAuditor:
     ############# LRT 監査用の関数群 #############
 
     ##### eta 学習モデルをつかう #####
+    def _take_feature_rows(
+        self,
+        X: FeatureMatrix,
+        row_selector: np.ndarray,
+    ) -> FeatureMatrix:
+        if isinstance(X, pd.DataFrame):
+            if row_selector.dtype == bool:
+                return X.iloc[np.flatnonzero(row_selector)]
+            return X.iloc[row_selector]
+        return X[row_selector]
+
     def _sample_x_given_y_for_eta_hat(
         self,
         *,
@@ -458,7 +505,7 @@ class LDPAuditor:
         n: int,
         rng: np.random.Generator,
         sample_source: Literal["val", "final"] = "final",
-    ) -> np.ndarray:
+    ) -> FeatureMatrix:
         if self.sim_hat:
             if self.spec is None:
                 raise ValueError("spec must be set.")
@@ -471,7 +518,7 @@ class LDPAuditor:
             )
             return self.project_l2_ball(X, B=self.B)
 
-        X_pool: np.ndarray | None = self.real_val_X if sample_source == "val" else self.real_final_X
+        X_pool: FeatureMatrix | None = self.real_val_X if sample_source == "val" else self.real_final_X
         y_pool: np.ndarray | None = self.real_val_y if sample_source == "val" else self.real_final_y
         assert X_pool is not None and y_pool is not None
 
@@ -481,7 +528,7 @@ class LDPAuditor:
                 f"No real-data samples with y={y_input} were found in {sample_source} pool."
             )
         chosen: np.ndarray = rng.choice(idx_all, size=int(n), replace=True)
-        return np.asarray(X_pool[chosen], dtype=float)
+        return self._take_feature_rows(X_pool, chosen)
 
     def _sample_p_theta_hat(
         self,
@@ -495,7 +542,7 @@ class LDPAuditor:
         完全LRT用：eta(x) を学習モデルで推定する版
         p((x,\tilde y)|Y=1) / p((x,\tilde y)|Y=0) の単調変換を返す
         """
-        X: np.ndarray = self._sample_x_given_y_for_eta_hat(
+        X: FeatureMatrix = self._sample_x_given_y_for_eta_hat(
             y_input=y_input,
             n=n,
             rng=rng,
@@ -531,7 +578,7 @@ class LDPAuditor:
         X-only（Decomposition）用：
         score_x = logit(eta_hat(x)) + log(P[Y=0]/P[Y=1])
         """
-        X: np.ndarray = self._sample_x_given_y_for_eta_hat(
+        X: FeatureMatrix = self._sample_x_given_y_for_eta_hat(
             y_input=y_input,
             n=n,
             rng=rng,
@@ -700,7 +747,7 @@ class LDPAuditor:
     def _select_score_fn_for_eta_model(
         self,
         *,
-        X_val: np.ndarray,
+        X_val: FeatureMatrix,
         y_val: np.ndarray,
         selection: Literal["eps_lower", "eps_emp", "tpr_at_fpr"] = "eps_lower",
         rng_seed_for_val: int = 0,
@@ -721,8 +768,9 @@ class LDPAuditor:
         def score_fn(model) -> float:
             # attack_for_selection に応じて null 側スコアから tau,q を作る
             if attack_for_selection == "indirect_LRT_hat":
+                X_null = self._take_feature_rows(X_val, y_val == y_null)
                 scores_null: np.ndarray = self._eta_to_x_lr_prob(
-                    predict_eta(model, X_val[y_val == y_null])
+                    predict_eta(model, X_null)
                 )
             elif attack_for_selection == "complete_LRT_hat":
                 rng_tau: Generator = np.random.default_rng(rng_seed_for_val + 12345)
@@ -781,9 +829,9 @@ class LDPAuditor:
         sim_n_train: int | None = 4000,
         sim_n_val: int | None = 2000,
         # 実データ用（simulationなら None でOK）
-        X_train: np.ndarray | None = None,
+        X_train: FeatureMatrix | None = None,
         y_train: np.ndarray | None = None,
-        X_val: np.ndarray | None = None,
+        X_val: FeatureMatrix | None = None,
         y_val: np.ndarray | None = None,
         y_alt: int = 1,
         y_null: int = 0,
@@ -893,8 +941,9 @@ class LDPAuditor:
                 }
 
                 if attack_name == "indirect_LRT_hat":
+                    X_null = self._take_feature_rows(X_val, y_val == y_null)
                     scores_null: np.ndarray = self._eta_to_x_lr_prob(
-                        predict_eta(model, X_val[y_val == y_null])
+                        predict_eta(model, X_null)
                     )
                 elif attack_name == "complete_LRT_hat":
                     rng_tau: Generator = np.random.default_rng(int(rng.integers(1 << 31)))
@@ -906,7 +955,7 @@ class LDPAuditor:
                         sample_source="val",
                     )
                 else:
-                    scores_null = predict_eta(model, X_val[y_val == y_null])
+                    scores_null = predict_eta(model, self._take_feature_rows(X_val, y_val == y_null))
 
                 tau, q = dp_sniper_threshold_from_scores(scores_null, c=self.c)
                 tau = float(np.clip(tau, 1e-15, 1.0 - 1e-15))
@@ -1317,6 +1366,7 @@ class LDPAuditor:
 
         setting_seed(random_state)
         np.random.seed(random_state)
+        SS_Client = _get_ss_client()
 
         count = 0
         for _ in range(trials):
@@ -1358,6 +1408,7 @@ class LDPAuditor:
         
         setting_seed(random_state)
         np.random.seed(random_state)
+        UE_Client = _get_ue_client()
 
         count = 0
         for _ in range(trials):
@@ -1399,6 +1450,7 @@ class LDPAuditor:
         
         setting_seed(random_state)
         np.random.seed(random_state)
+        UE_Client = _get_ue_client()
 
         count = 0
         for _ in range(trials):
@@ -1440,6 +1492,7 @@ class LDPAuditor:
         
         setting_seed(random_state)
         np.random.seed(random_state)
+        HE_Client = _get_he_client()
 
         res: OptimizeResult = minimize_scalar(
             find_tresh,
@@ -1488,6 +1541,7 @@ class LDPAuditor:
         
         setting_seed(random_state)
         np.random.seed(random_state)
+        HE_Client = _get_he_client()
 
         count = 0
         for _ in range(trials):            
@@ -1529,6 +1583,7 @@ class LDPAuditor:
         
         setting_seed(random_state)
         np.random.seed(random_state)
+        LH_Client = _get_lh_client()
 
         g = 2 # Binary LH (BLH) parameter
         count = 0
@@ -1571,6 +1626,7 @@ class LDPAuditor:
         
         setting_seed(random_state)
         np.random.seed(random_state)
+        LH_Client = _get_lh_client()
 
         g = int(np.round(np.exp(epsilon))) + 1 # Optimal LH (OLH) parameter
         count = 0
@@ -1614,6 +1670,7 @@ class LDPAuditor:
         
         setting_seed(random_state)
         np.random.seed(random_state)
+        AGRR_Client, _, _, _, _ = _get_approximate_ldp_symbols()
 
         count = 0
         for _ in range(trials):
@@ -1655,6 +1712,7 @@ class LDPAuditor:
         
         setting_seed(random_state)
         np.random.seed(random_state)
+        _, _, ASUE_Client, _, _ = _get_approximate_ldp_symbols()
 
         count = 0
         for _ in range(trials):
@@ -1696,6 +1754,7 @@ class LDPAuditor:
         
         setting_seed(random_state)
         np.random.seed(random_state)
+        _, _, _, GM_Client, find_scale = _get_approximate_ldp_symbols()
 
         # Analytical Gaussian Mechanism (AGM)
         Delta_2 = np.sqrt(2)
@@ -1741,6 +1800,7 @@ class LDPAuditor:
         
         setting_seed(random_state)
         np.random.seed(random_state)
+        _, _, _, GM_Client, _ = _get_approximate_ldp_symbols()
 
         # Standard Gaussian Mechanism (GM)
         Delta_2 = np.sqrt(2)
@@ -1784,6 +1844,7 @@ class LDPAuditor:
         
         setting_seed(random_state)
         np.random.seed(random_state)
+        _, ALH_Client, _, _, _ = _get_approximate_ldp_symbols()
 
         g = 2
         count = 0
@@ -1824,6 +1885,7 @@ class LDPAuditor:
         
         setting_seed(random_state)
         np.random.seed(random_state)
+        _, ALH_Client, _, _, _ = _get_approximate_ldp_symbols()
 
         g = max(2, int(np.round((-3 * np.exp(epsilon) * delta - np.sqrt(np.exp(epsilon) - 1) * np.sqrt((1 - delta) * (np.exp(epsilon) + delta - 9 * np.exp(epsilon) * delta - 1)) + np.exp(epsilon) + 3 * delta - 1) / (2 * delta))))
         count = 0
@@ -1867,6 +1929,7 @@ class LDPAuditor:
         
         setting_seed(random_state)
         np.random.seed(random_state)
+        UEClient = _get_pure_ldp_ue_client()
 
         SUE_Client = UEClient(epsilon, k, use_oue=False, index_mapper=lambda x:x)
 
@@ -1908,6 +1971,7 @@ class LDPAuditor:
         
         setting_seed(random_state)
         np.random.seed(random_state)
+        UEClient = _get_pure_ldp_ue_client()
 
         OUE_Client = UEClient(epsilon, k, use_oue=True, index_mapper=lambda x:x)
 

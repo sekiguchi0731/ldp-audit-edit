@@ -1,7 +1,17 @@
 # general imports
 import numpy as np
-from numba import jit, prange
 import xxhash
+
+try:
+    from numba import jit, prange
+except Exception:
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
+    def prange(*args):
+        return range(*args)
 
 # --- GRR(k=2) のチャネルパラメータ ---
 @jit(nopython=True)

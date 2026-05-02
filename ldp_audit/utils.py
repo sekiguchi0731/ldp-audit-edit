@@ -1,9 +1,16 @@
 # general imports
 import numpy as np
-from numba import jit
 from scipy.optimize import minimize_scalar
 from sys import maxsize
 import xxhash
+
+try:
+    from numba import jit
+except Exception:
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
 
 def LHO_Client(input_data, g):
     """
