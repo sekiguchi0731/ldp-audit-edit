@@ -5,11 +5,13 @@ from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
 import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer, make_column_selector
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.svm import SVC
 
 
@@ -32,10 +34,10 @@ class EtaModelConfig:
 
 def _build_logreg(params: dict[str, Any], seed: int) -> LogisticRegression:
     print("Building Logistic Regression with params:", params)
-    # L2 only; solver lbfgs stable for small/medium d
+    # L2 only; saga handles both dense numeric data and sparse one-hot features.
     return LogisticRegression(
         penalty="l2",
-        solver="lbfgs",
+        solver="saga",
         max_iter=5000,
         random_state=seed,
         **params,
@@ -73,8 +75,30 @@ def _build_mlp(params: dict[str, Any], seed: int) -> MLPClassifier:
     )
 
 
+def _build_real_data_preprocessor(
+    X_sample: pd.DataFrame,
+    *,
+    needs_scaling: bool,
+) -> ColumnTransformer:
+    del X_sample, needs_scaling
+    return ColumnTransformer(
+        transformers=[
+            ("num", "passthrough", make_column_selector(dtype_include=np.number)),  # type: ignore
+            (
+                "cat",
+                OneHotEncoder(handle_unknown="ignore", sparse_output=True),
+                make_column_selector(dtype_exclude=np.number),  # type: ignore
+            ),
+        ],
+        sparse_threshold=1.0,
+    )   # type: ignore -- ColumnTransformer typing is weird and doesn't recognize sparse_threshold argument
+
+
 def make_eta_pipeline(
-    cfg: EtaModelConfig, params: dict[str, Any], seed: int
+    cfg: EtaModelConfig,
+    params: dict[str, Any],
+    seed: int,
+    X_sample: np.ndarray | pd.DataFrame | None = None,
 ) -> Pipeline:
     """
     Build an sklearn Pipeline for eta(x)=P(Y=1|X=x) estimation.
@@ -84,6 +108,16 @@ def make_eta_pipeline(
     Pipeline with ``fit``/``predict_proba`` interface.
     """
     est: LogisticRegression | SVC | RandomForestClassifier | MLPClassifier = cfg.builder(params, seed)
+    if isinstance(X_sample, pd.DataFrame):
+        return Pipeline(
+            [
+                (
+                    "preprocess",
+                    _build_real_data_preprocessor(X_sample, needs_scaling=cfg.needs_scaling),
+                ),
+                ("clf", est),
+            ]
+        )
     if cfg.needs_scaling:
         return Pipeline([("scaler", StandardScaler()), ("clf", est)])
     return Pipeline([("clf", est)])
@@ -190,9 +224,9 @@ def _check_binary_labels(y: np.ndarray) -> None:
 def fit_and_select_eta_model(
     *,
     cfg: EtaModelConfig,
-    X_train: np.ndarray,
+    X_train: np.ndarray | pd.DataFrame,
     y_train: np.ndarray,
-    X_val: np.ndarray,
+    X_val: np.ndarray | pd.DataFrame,
     y_val: np.ndarray,
     seed: int,
     score_fn: Callable[[Pipeline], float],
@@ -212,7 +246,7 @@ def fit_and_select_eta_model(
     }
 
     for params in cfg.param_grid:
-        model: Pipeline = make_eta_pipeline(cfg, params, seed=seed)
+        model: Pipeline = make_eta_pipeline(cfg, params, seed=seed, X_sample=X_train)
         model.fit(X_train, y_train)
         s = float(score_fn(model))
         if s > best["score"]:
@@ -228,7 +262,7 @@ def fit_and_select_eta_model(
     return best
 
 
-def predict_eta(model: Any, X: np.ndarray) -> np.ndarray:
+def predict_eta(model: Any, X: np.ndarray | pd.DataFrame) -> np.ndarray:
     """
     Return eta_hat(x)=P(Y=1|X=x) for binary y.
     Requires model to implement predict_proba.
