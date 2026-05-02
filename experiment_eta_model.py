@@ -366,6 +366,137 @@ def _reservoir_sample_csv_rows(
     return reservoir
 
 
+def _reservoir_sample_csv_rows_raw(
+    *,
+    csv_path: str,
+    n_rows: int,
+    seed: int,
+    chunksize: int = 100_000,
+) -> np.ndarray:
+    if n_rows <= 0:
+        raise ValueError(f"n_rows must be positive, got {n_rows}.")
+
+    rng: Generator = np.random.default_rng(seed)
+    reservoir: np.ndarray | None = None
+    seen: int = 0
+
+    for chunk in pd.read_csv(
+        csv_path,
+        header=None,
+        chunksize=chunksize,
+        dtype=str,
+        keep_default_na=False,
+        na_filter=False,
+    ):
+        arr: np.ndarray = chunk.to_numpy(dtype=object, copy=False)
+        if reservoir is None:
+            reservoir = np.empty((n_rows, arr.shape[1]), dtype=object)
+        for row in arr:
+            seen += 1
+            if seen <= n_rows:
+                reservoir[seen - 1] = row
+            else:
+                j: int = int(rng.integers(seen))
+                if j < n_rows:
+                    reservoir[j] = row
+
+    if reservoir is None or seen < n_rows:
+        raise ValueError(f"Requested n_rows={n_rows}, but csv only had {seen} rows.")
+    return reservoir
+
+
+def _infer_real_csv_feature_kinds(
+    *,
+    csv_path: str,
+    sample_rows: int = 50_000,
+) -> list[str]:
+    sample_df: pd.DataFrame = pd.read_csv(
+        csv_path,
+        header=None,
+        nrows=sample_rows,
+        dtype=str,
+        keep_default_na=False,
+        na_filter=False,
+    )
+    if sample_df.shape[1] < 2:
+        raise ValueError(
+            "real_data csv must contain at least 2 columns (label + features). "
+            f"Got shape={sample_df.shape}."
+        )
+
+    kinds: list[str] = []
+    for col_idx in range(1, sample_df.shape[1]):
+        col: pd.Series[str] = sample_df.iloc[:, col_idx].astype(str).str.strip()
+        numeric: pd.Series   = pd.to_numeric(col, errors="coerce")
+        kinds.append("numeric" if bool(numeric.notna().all()) else "categorical")
+    return kinds
+
+
+def _hash_categorical_series(series: pd.Series) -> np.ndarray:
+    tokens: pd.Series[str] = series.astype(str)
+    hashed: np.ndarray = pd.util.hash_pandas_object(tokens, index=False).to_numpy(dtype=np.uint64)
+    scaled = (hashed.astype(np.float64) / np.float64(np.iinfo(np.uint64).max)) * 2.0 - 1.0
+    return scaled.astype(np.float32, copy=False)
+
+
+def _encode_real_csv_frame(
+    *,
+    frame: pd.DataFrame,
+    feature_kinds: Sequence[str],
+) -> tuple[np.ndarray, np.ndarray]:
+    if frame.shape[1] != len(feature_kinds) + 1:
+        raise ValueError(
+            "Feature kind schema does not match csv width. "
+            f"frame.shape={frame.shape}, len(feature_kinds)={len(feature_kinds)}."
+        )
+
+    y: np.ndarray = pd.to_numeric(frame.iloc[:, 0], errors="raise").to_numpy(dtype=np.int64, copy=False)
+    X: np.ndarray = np.empty((len(frame), len(feature_kinds)), dtype=np.float32)
+
+    for feature_idx, kind in enumerate(feature_kinds, start=1):
+        col: pd.Series = frame.iloc[:, feature_idx]
+        if kind == "numeric":
+            X[:, feature_idx - 1] = pd.to_numeric(col, errors="raise").to_numpy(
+                dtype=np.float32,
+                copy=False,
+            )
+        elif kind == "categorical":
+            X[:, feature_idx - 1] = _hash_categorical_series(col)
+        else:
+            raise ValueError(f"Unknown feature kind: {kind}")
+    return X, y
+
+
+def _load_mixed_real_csv_all_rows(
+    *,
+    csv_path: str,
+    total_rows: int,
+    feature_kinds: Sequence[str],
+    chunksize: int = 100_000,
+) -> tuple[np.ndarray, np.ndarray]:
+    X: np.ndarray = np.empty((total_rows, len(feature_kinds)), dtype=np.float32)
+    y: np.ndarray = np.empty(total_rows, dtype=np.int64)
+
+    start = 0
+    for chunk in pd.read_csv(
+        csv_path,
+        header=None,
+        chunksize=chunksize,
+        dtype=str,
+        keep_default_na=False,
+        na_filter=False,
+    ):
+        X_chunk, y_chunk = _encode_real_csv_frame(frame=chunk, feature_kinds=feature_kinds)
+        end: int = start + len(chunk)
+        X[start:end] = X_chunk
+        y[start:end] = y_chunk
+        start: int = end
+
+    if start != total_rows:
+        raise ValueError(f"Expected {total_rows} rows, but loaded {start}.")
+    return X, y
+
+
 def load_susy_real_data_split(
     *,
     csv_path: str,
@@ -377,14 +508,40 @@ def load_susy_real_data_split(
     n_total = int(n_train + n_val + n_final)
     total_rows: int = _count_csv_rows(csv_path)
     logging.info(f"[load_susy] total_rows={total_rows}, requested={n_total}")
+    feature_kinds: list[str] = _infer_real_csv_feature_kinds(csv_path=csv_path)
+    numeric_only: bool = all(kind == "numeric" for kind in feature_kinds)
+    logging.info(
+        "[load_susy] detected %s feature columns (%s numeric, %s categorical)",
+        len(feature_kinds),
+        sum(kind == "numeric" for kind in feature_kinds),
+        sum(kind == "categorical" for kind in feature_kinds),
+    )
 
-    if n_total == total_rows:
-        sampled: np.ndarray = pd.read_csv(csv_path, header=None, dtype=np.float32).to_numpy(dtype=np.float32, copy=False)
+    if numeric_only:
+        if n_total == total_rows:
+            sampled: np.ndarray = pd.read_csv(csv_path, header=None, dtype=np.float32).to_numpy(
+                dtype=np.float32,
+                copy=False,
+            )
+        else:
+            sampled = _reservoir_sample_csv_rows(csv_path=csv_path, n_rows=n_total, seed=seed)
+        y: np.ndarray = sampled[:, 0].astype(np.int64)
+        X: np.ndarray = sampled[:, 1:].astype(np.float32)
     else:
-        sampled = _reservoir_sample_csv_rows(csv_path=csv_path, n_rows=n_total, seed=seed)
-
-    y: np.ndarray = sampled[:, 0].astype(np.int64)
-    X: np.ndarray = sampled[:, 1:].astype(np.float32)
+        if n_total == total_rows:
+            X, y = _load_mixed_real_csv_all_rows(
+                csv_path=csv_path,
+                total_rows=total_rows,
+                feature_kinds=feature_kinds,
+            )
+        else:
+            sampled_raw: np.ndarray = _reservoir_sample_csv_rows_raw(
+                csv_path=csv_path,
+                n_rows=n_total,
+                seed=seed,
+            )
+            sampled_frame: pd.DataFrame = pd.DataFrame(sampled_raw)
+            X, y = _encode_real_csv_frame(frame=sampled_frame, feature_kinds=feature_kinds)
 
     X_train, X_rest, y_train, y_rest = train_test_split(
         X,
@@ -1127,4 +1284,3 @@ if __name__ == "__main__":
 #   --N_ratio 0.2,0.2,0.6 \
 #   --seed_start 0 \
 #   --seed_end 3
-
