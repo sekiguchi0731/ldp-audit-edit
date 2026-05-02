@@ -76,6 +76,9 @@ class EtaExperimentConfig:
     output_root: str = "./results"
 
 
+FeatureMatrix = np.ndarray | pd.DataFrame
+
+
 def _count_csv_rows(csv_path: str, chunksize: int = 1 << 20) -> int:
     total: int = 0
     with open(csv_path, "rb") as f:
@@ -202,11 +205,11 @@ def _estimate_binary_class_prior(y: np.ndarray) -> tuple[float, float]:
 def _save_indirect_score_distributions(
     *,
     eta_model_cfgs: Sequence[EtaModelConfig],
-    X_train: np.ndarray,
+    X_train: FeatureMatrix,
     y_train: np.ndarray,
-    X_val: np.ndarray,
+    X_val: FeatureMatrix,
     y_val: np.ndarray,
-    X_final: np.ndarray,
+    X_final: FeatureMatrix,
     y_final: np.ndarray,
     output_dir: Path,
     data_name: str,
@@ -432,18 +435,11 @@ def _infer_real_csv_feature_kinds(
     return kinds
 
 
-def _hash_categorical_series(series: pd.Series) -> np.ndarray:
-    tokens: pd.Series[str] = series.astype(str)
-    hashed: np.ndarray = pd.util.hash_pandas_object(tokens, index=False).to_numpy(dtype=np.uint64)
-    scaled = (hashed.astype(np.float64) / np.float64(np.iinfo(np.uint64).max)) * 2.0 - 1.0
-    return scaled.astype(np.float32, copy=False)
-
-
-def _encode_real_csv_frame(
+def _coerce_real_csv_frame(
     *,
     frame: pd.DataFrame,
     feature_kinds: Sequence[str],
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[pd.DataFrame, np.ndarray]:
     if frame.shape[1] != len(feature_kinds) + 1:
         raise ValueError(
             "Feature kind schema does not match csv width. "
@@ -451,20 +447,18 @@ def _encode_real_csv_frame(
         )
 
     y: np.ndarray = pd.to_numeric(frame.iloc[:, 0], errors="raise").to_numpy(dtype=np.int64, copy=False)
-    X: np.ndarray = np.empty((len(frame), len(feature_kinds)), dtype=np.float32)
+    columns: dict[str, pd.Series] = {}
 
     for feature_idx, kind in enumerate(feature_kinds, start=1):
-        col: pd.Series = frame.iloc[:, feature_idx]
+        col_name: str = f"f{feature_idx - 1}"
+        col: pd.Series = frame.iloc[:, feature_idx].astype(str).str.strip()
         if kind == "numeric":
-            X[:, feature_idx - 1] = pd.to_numeric(col, errors="raise").to_numpy(
-                dtype=np.float32,
-                copy=False,
-            )
+            columns[col_name] = pd.to_numeric(col, errors="raise").astype(np.float32)
         elif kind == "categorical":
-            X[:, feature_idx - 1] = _hash_categorical_series(col)
+            columns[col_name] = col.astype("category")
         else:
             raise ValueError(f"Unknown feature kind: {kind}")
-    return X, y
+    return pd.DataFrame(columns), y
 
 
 def _load_mixed_real_csv_all_rows(
@@ -473,11 +467,10 @@ def _load_mixed_real_csv_all_rows(
     total_rows: int,
     feature_kinds: Sequence[str],
     chunksize: int = 100_000,
-) -> tuple[np.ndarray, np.ndarray]:
-    X: np.ndarray = np.empty((total_rows, len(feature_kinds)), dtype=np.float32)
-    y: np.ndarray = np.empty(total_rows, dtype=np.int64)
+) -> tuple[pd.DataFrame, np.ndarray]:
+    X_parts: list[pd.DataFrame] = []
+    y_parts: list[np.ndarray] = []
 
-    start = 0
     for chunk in pd.read_csv(
         csv_path,
         header=None,
@@ -486,15 +479,18 @@ def _load_mixed_real_csv_all_rows(
         keep_default_na=False,
         na_filter=False,
     ):
-        X_chunk, y_chunk = _encode_real_csv_frame(frame=chunk, feature_kinds=feature_kinds)
-        end: int = start + len(chunk)
-        X[start:end] = X_chunk
-        y[start:end] = y_chunk
-        start: int = end
+        X_chunk, y_chunk = _coerce_real_csv_frame(frame=chunk, feature_kinds=feature_kinds)
+        X_parts.append(X_chunk)
+        y_parts.append(y_chunk)
 
-    if start != total_rows:
-        raise ValueError(f"Expected {total_rows} rows, but loaded {start}.")
-    return X, y
+    loaded_rows: int = sum(len(part) for part in X_parts)
+    if loaded_rows != total_rows:
+        raise ValueError(f"Expected {total_rows} rows, but loaded {loaded_rows}.")
+    X: pd.DataFrame = pd.concat(X_parts, axis=0, ignore_index=True)
+    for feature_idx, kind in enumerate(feature_kinds):
+        if kind == "categorical":
+            X[f"f{feature_idx}"] = X[f"f{feature_idx}"].astype("category")
+    return X, np.concatenate(y_parts, axis=0)
 
 
 def load_susy_real_data_split(
@@ -504,7 +500,7 @@ def load_susy_real_data_split(
     n_val: int,
     n_final: int,
     seed: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[FeatureMatrix, np.ndarray, FeatureMatrix, np.ndarray, FeatureMatrix, np.ndarray]:
     n_total = int(n_train + n_val + n_final)
     total_rows: int = _count_csv_rows(csv_path)
     logging.info(f"[load_susy] total_rows={total_rows}, requested={n_total}")
@@ -533,7 +529,7 @@ def load_susy_real_data_split(
                 csv_path=csv_path,
                 total_rows=total_rows,
                 feature_kinds=feature_kinds,
-            )
+            )   # type: ignore
         else:
             sampled_raw: np.ndarray = _reservoir_sample_csv_rows_raw(
                 csv_path=csv_path,
@@ -541,7 +537,7 @@ def load_susy_real_data_split(
                 seed=seed,
             )
             sampled_frame: pd.DataFrame = pd.DataFrame(sampled_raw)
-            X, y = _encode_real_csv_frame(frame=sampled_frame, feature_kinds=feature_kinds)
+            X, y = _coerce_real_csv_frame(frame=sampled_frame, feature_kinds=feature_kinds) # type: ignore
 
     X_train, X_rest, y_train, y_rest = train_test_split(
         X,
@@ -621,11 +617,11 @@ def run_eta_model_experiments(
     cfg: EtaExperimentConfig,
     lst_seed: Iterable[int],
     # real-data mode (optional). If provided, simulation generation is skipped.
-    X_train: np.ndarray | None = None,
+    X_train: FeatureMatrix | None = None,
     y_train: np.ndarray | None = None,
-    X_val: np.ndarray | None = None,
+    X_val: FeatureMatrix | None = None,
     y_val: np.ndarray | None = None,
-    X_final: np.ndarray | None = None,
+    X_final: FeatureMatrix | None = None,
     y_final: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """
