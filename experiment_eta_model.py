@@ -411,6 +411,7 @@ def _reservoir_sample_csv_rows_raw(
 def _infer_real_csv_feature_kinds(
     *,
     csv_path: str,
+    real_data_name: str | None = None,
     sample_rows: int = 50_000,
 ) -> list[str]:
     sample_df: pd.DataFrame = pd.read_csv(
@@ -426,6 +427,15 @@ def _infer_real_csv_feature_kinds(
             "real_data csv must contain at least 2 columns (label + features). "
             f"Got shape={sample_df.shape}."
         )
+
+    num_features: int = sample_df.shape[1] - 1
+    if real_data_name is not None and str(real_data_name).strip().lower() == "criteosearch":
+        if num_features != 20:
+            raise ValueError(
+                "CriteoSearch schema expects exactly 20 feature columns after the label. "
+                f"Got {num_features}."
+            )
+        return ["numeric", "numeric", "numeric"] + ["categorical"] * 17
 
     kinds: list[str] = []
     for col_idx in range(1, sample_df.shape[1]):
@@ -500,11 +510,15 @@ def load_susy_real_data_split(
     n_val: int,
     n_final: int,
     seed: int,
+    real_data_name: str | None = None,
 ) -> tuple[FeatureMatrix, np.ndarray, FeatureMatrix, np.ndarray, FeatureMatrix, np.ndarray]:
     n_total = int(n_train + n_val + n_final)
     total_rows: int = _count_csv_rows(csv_path)
     logging.info(f"[load_susy] total_rows={total_rows}, requested={n_total}")
-    feature_kinds: list[str] = _infer_real_csv_feature_kinds(csv_path=csv_path)
+    feature_kinds: list[str] = _infer_real_csv_feature_kinds(
+        csv_path=csv_path,
+        real_data_name=real_data_name,
+    )
     numeric_only: bool = all(kind == "numeric" for kind in feature_kinds)
     logging.info(
         "[load_susy] detected %s feature columns (%s numeric, %s categorical)",
@@ -1203,6 +1217,7 @@ if __name__ == "__main__":
                 n_val=int(cfg.sim_n_val),
                 n_final=int(cfg.nb_trials),
                 seed=int(args.real_data_seed),
+                real_data_name=args.real_data_name,
             )
             df: pd.DataFrame = run_eta_model_experiments(
                 cfg=cfg,
