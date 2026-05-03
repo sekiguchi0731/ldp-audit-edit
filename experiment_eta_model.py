@@ -436,6 +436,13 @@ def _infer_real_csv_feature_kinds(
                 f"Got {num_features}."
             )
         return ["numeric", "numeric", "numeric"] + ["categorical"] * 17
+    if real_data_name is not None and str(real_data_name).strip().lower() == "avazu":
+        if num_features != 22:
+            raise ValueError(
+                "Avazu schema expects exactly 22 feature columns after the label. "
+                f"Got {num_features}."
+            )
+        return ["categorical"] * 22
 
     kinds: list[str] = []
     for col_idx in range(1, sample_df.shape[1]):
@@ -445,22 +452,100 @@ def _infer_real_csv_feature_kinds(
     return kinds
 
 
+def _get_real_csv_feature_names(
+    *,
+    real_data_name: str | None,
+    num_features: int,
+) -> list[str]:
+    if real_data_name is not None and str(real_data_name).strip().lower() == "criteosearch":
+        expected_names: list[str] = [
+            "click_timestamp",
+            "nb_clicks_1week",
+            "product_price",
+            "product_age_group",
+            "device_type",
+            "audience_id",
+            "product_gender",
+            "product_brand",
+            "product_category1",
+            "product_category2",
+            "product_category3",
+            "product_category4",
+            "product_category5",
+            "product_category6",
+            "product_category7",
+            "product_country",
+            "product_id",
+            "product_title",
+            "partner_id",
+            "user_id",
+        ]
+        if num_features != len(expected_names):
+            raise ValueError(
+                "CriteoSearch feature naming expects exactly 20 feature columns after the label. "
+                f"Got {num_features}."
+            )
+        return expected_names
+    if real_data_name is not None and str(real_data_name).strip().lower() == "avazu":
+        expected_names = [
+            "hour",
+            "C1",
+            "banner_pos",
+            "site_id",
+            "site_domain",
+            "site_category",
+            "app_id",
+            "app_domain",
+            "app_category",
+            "device_id",
+            "device_ip",
+            "device_model",
+            "device_type",
+            "device_conn_type",
+            "C14",
+            "C15",
+            "C16",
+            "C17",
+            "C18",
+            "C19",
+            "C20",
+            "C21",
+        ]
+        if num_features != len(expected_names):
+            raise ValueError(
+                "Avazu feature naming expects exactly 22 feature columns after the label. "
+                f"Got {num_features}."
+            )
+        return expected_names
+    return [f"f{feature_idx}" for feature_idx in range(num_features)]
+
+
 def _coerce_real_csv_frame(
     *,
     frame: pd.DataFrame,
     feature_kinds: Sequence[str],
+    feature_names: Sequence[str] | None = None,
 ) -> tuple[pd.DataFrame, np.ndarray]:
     if frame.shape[1] != len(feature_kinds) + 1:
         raise ValueError(
             "Feature kind schema does not match csv width. "
             f"frame.shape={frame.shape}, len(feature_kinds)={len(feature_kinds)}."
         )
+    if feature_names is None:
+        feature_name_list: list[str] = [f"f{feature_idx}" for feature_idx in range(len(feature_kinds))]
+    else:
+        feature_name_list = list(feature_names)
+        if len(feature_name_list) != len(feature_kinds):
+            raise ValueError(
+                "Feature names do not match feature kinds. "
+                f"len(feature_names)={len(feature_name_list)}, len(feature_kinds)={len(feature_kinds)}."
+            )
 
     y: np.ndarray = pd.to_numeric(frame.iloc[:, 0], errors="raise").to_numpy(dtype=np.int64, copy=False)
     columns: dict[str, pd.Series] = {}
 
     for feature_idx, kind in enumerate(feature_kinds, start=1):
-        col_name: str = f"f{feature_idx - 1}"
+        col_name: str = feature_name_list[feature_idx - 1]
         col: pd.Series = frame.iloc[:, feature_idx].astype(str).str.strip()
         if kind == "numeric":
             columns[col_name] = pd.to_numeric(col, errors="raise").astype(np.float32)
@@ -476,6 +561,7 @@ def _load_mixed_real_csv_all_rows(
     csv_path: str,
     total_rows: int,
     feature_kinds: Sequence[str],
+    feature_names: Sequence[str] | None = None,
     chunksize: int = 100_000,
 ) -> tuple[pd.DataFrame, np.ndarray]:
     X_parts: list[pd.DataFrame] = []
@@ -489,7 +575,11 @@ def _load_mixed_real_csv_all_rows(
         keep_default_na=False,
         na_filter=False,
     ):
-        X_chunk, y_chunk = _coerce_real_csv_frame(frame=chunk, feature_kinds=feature_kinds)
+        X_chunk, y_chunk = _coerce_real_csv_frame(
+            frame=chunk,
+            feature_kinds=feature_kinds,
+            feature_names=feature_names,
+        )
         X_parts.append(X_chunk)
         y_parts.append(y_chunk)
 
@@ -497,9 +587,14 @@ def _load_mixed_real_csv_all_rows(
     if loaded_rows != total_rows:
         raise ValueError(f"Expected {total_rows} rows, but loaded {loaded_rows}.")
     X: pd.DataFrame = pd.concat(X_parts, axis=0, ignore_index=True)
+    feature_name_list: list[str]
+    if feature_names is None:
+        feature_name_list = [f"f{feature_idx}" for feature_idx in range(len(feature_kinds))]
+    else:
+        feature_name_list = list(feature_names)
     for feature_idx, kind in enumerate(feature_kinds):
         if kind == "categorical":
-            X[f"f{feature_idx}"] = X[f"f{feature_idx}"].astype("category")
+            X[feature_name_list[feature_idx]] = X[feature_name_list[feature_idx]].astype("category")
     return X, np.concatenate(y_parts, axis=0)
 
 
@@ -518,6 +613,10 @@ def load_susy_real_data_split(
     feature_kinds: list[str] = _infer_real_csv_feature_kinds(
         csv_path=csv_path,
         real_data_name=real_data_name,
+    )
+    feature_names: list[str] = _get_real_csv_feature_names(
+        real_data_name=real_data_name,
+        num_features=len(feature_kinds),
     )
     numeric_only: bool = all(kind == "numeric" for kind in feature_kinds)
     logging.info(
@@ -543,6 +642,7 @@ def load_susy_real_data_split(
                 csv_path=csv_path,
                 total_rows=total_rows,
                 feature_kinds=feature_kinds,
+                feature_names=feature_names,
             )   # type: ignore
         else:
             sampled_raw: np.ndarray = _reservoir_sample_csv_rows_raw(
@@ -551,7 +651,11 @@ def load_susy_real_data_split(
                 seed=seed,
             )
             sampled_frame: pd.DataFrame = pd.DataFrame(sampled_raw)
-            X, y = _coerce_real_csv_frame(frame=sampled_frame, feature_kinds=feature_kinds) # type: ignore
+            X, y = _coerce_real_csv_frame(
+                frame=sampled_frame,
+                feature_kinds=feature_kinds,
+                feature_names=feature_names,
+            ) # type: ignore
 
     X_train, X_rest, y_train, y_rest = train_test_split(
         X,
@@ -1284,7 +1388,7 @@ if __name__ == "__main__":
 #   --seed_end 9 \
 #   --score_dist
 
-# python experiment_eta_model.py \
+# time python experiment_eta_model.py \
 #   --real_data \
 #   --real_data_path ./data/criteo_search/criteo_search_numeric.csv \
 #   --real_data_name CriteoSearch \
@@ -1294,4 +1398,18 @@ if __name__ == "__main__":
 #   --N_total 3597294 \
 #   --N_ratio 0.2,0.2,0.6 \
 #   --seed_start 0 \
-#   --seed_end 3
+#   --seed_end 3 \
+#   --score_dist
+
+# python experiment_eta_model.py \
+#   --real_data \
+#   --real_data_path ./data/avazu/avazu_train_label_first.csv \
+#   --real_data_name Avazu \
+#   --output_root ./results/20260401 \
+#   --evaluate_both_reports \
+#   --hyperparameter fixed \
+#   --N_total 100000 \
+#   --N_ratio 0.2,0.2,0.6 \
+#   --seed_start 0 \
+#   --seed_end 1 \
+#   --score_dist
