@@ -6,7 +6,8 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 import pandas as pd
-from sklearn.compose import ColumnTransformer, make_column_selector
+from sklearn.compose import ColumnTransformer
+from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
@@ -80,16 +81,39 @@ def _build_real_data_preprocessor(
     *,
     needs_scaling: bool,
 ) -> ColumnTransformer:
-    del X_sample, needs_scaling
-    return ColumnTransformer(
-        transformers=[
-            ("num", "passthrough", make_column_selector(dtype_include=np.number)),  # type: ignore
+    del needs_scaling
+    numeric_cols: list[str] = X_sample.select_dtypes(include=np.number).columns.tolist()
+    categorical_cols: list[str] = X_sample.select_dtypes(exclude=np.number).columns.tolist()
+    transformers: list[tuple[str, Any, Any]] = []
+
+    if len(numeric_cols) > 0:
+        transformers.append(("num", "passthrough", numeric_cols))
+
+    text_title_col: str | None = None
+    if "product_title" in X_sample.columns and "product_title" in categorical_cols:
+        text_title_col = "product_title"
+        categorical_cols = [col for col in categorical_cols if col != text_title_col]
+
+    if len(categorical_cols) > 0:
+        transformers.append(
             (
                 "cat",
                 OneHotEncoder(handle_unknown="ignore", sparse_output=True),
-                make_column_selector(dtype_exclude=np.number),  # type: ignore
-            ),
-        ],
+                categorical_cols,
+            )
+        )
+
+    if text_title_col is not None:
+        transformers.append(
+            (
+                "title",
+                CountVectorizer(binary=True, token_pattern=r"[^ ]+"),
+                text_title_col,
+            )
+        )
+
+    return ColumnTransformer(
+        transformers=transformers,
         sparse_threshold=1.0,
     )   # type: ignore -- ColumnTransformer typing is weird and doesn't recognize sparse_threshold argument
 
