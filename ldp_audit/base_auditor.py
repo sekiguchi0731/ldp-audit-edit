@@ -52,7 +52,7 @@ warnings.simplefilter("ignore")
 FeatureMatrix = np.ndarray | pd.DataFrame
 
 try:
-    from numba.core.errors import NumbaExperimentalFeatureWarning
+    from numba.core.errors import NumbaExperimentalFeatureWarning   # type: ignore
 except Exception:
     class NumbaExperimentalFeatureWarning(Warning):
         pass
@@ -833,6 +833,7 @@ class LDPAuditor:
         y_train: np.ndarray | None = None,
         X_val: FeatureMatrix | None = None,
         y_val: np.ndarray | None = None,
+        prefit_model_best_by_attack: dict[str, dict[str, dict[str, Any]]] | None = None,
         y_alt: int = 1,
         y_null: int = 0,
     ) -> dict:
@@ -899,6 +900,15 @@ class LDPAuditor:
 
         per_attack_model_best: dict[str, dict[str, dict[str, Any]]] = {}
         for selection_attack in selection_attack_list:
+            cached_best: dict[str, dict[str, Any]] | None = (
+                prefit_model_best_by_attack.get(str(selection_attack))
+                if prefit_model_best_by_attack is not None
+                else None
+            )
+            if cached_best is not None:
+                per_attack_model_best[str(selection_attack)] = cached_best
+                continue
+
             score_fn: Callable[..., float] = self._select_score_fn_for_eta_model(
                 X_val=X_val,
                 y_val=y_val,
@@ -934,7 +944,7 @@ class LDPAuditor:
             best_by_attack: dict[str, dict[str, Any]] = {}
             for attack_name in report_attack_list:
                 best: dict[str, Any] = per_attack_model_best[str(attack_name)][name]
-                model: Pipeline = best["model"]
+                model: Any = best["model"]
                 best_by_attack[str(attack_name)] = {
                     "best_val_score": float(best["score"]),
                     "params": best["params"],
@@ -993,6 +1003,7 @@ class LDPAuditor:
         return {
             "selection": selection,
             "report_attacks": [str(a) for a in report_attack_list],
+            "model_best_by_attack": per_attack_model_best,
             "eta_class_prior": {
                 "prior_0": float(prior_0),
                 "prior_1": float(prior_1),

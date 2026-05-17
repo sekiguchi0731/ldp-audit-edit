@@ -8,7 +8,7 @@ import json
 import logging
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable, Literal, Sequence, Callable, cast
+from typing import Any, Iterable, Literal, Sequence, Callable, cast
 
 import numpy as np
 from numpy.random import Generator
@@ -22,6 +22,7 @@ from ldp_audit.eta_models import (
     fit_and_select_eta_model,
     get_default_eta_model_configs,
     get_fixed_logreg_eta_model_configs,
+    get_libffm_eta_model_configs,
     get_reduced_eta_model_configs,
     predict_eta,
 )
@@ -56,6 +57,10 @@ class EtaExperimentConfig:
     evaluate_both_reports: bool = True
     use_reduced_grid: bool = True
     hyperparameter: Literal["grid", "fixed"] = "grid"
+    eta_models: tuple[str, ...] = ("logreg", "svm_rbf", "rf", "mlp")
+    ffm_train_path: str = "ffm-train"
+    ffm_predict_path: str = "ffm-predict"
+    ffm_threads: int = 1
 
     # simulation dataset config
     sim_d: int = 2
@@ -77,6 +82,55 @@ class EtaExperimentConfig:
 
 
 FeatureMatrix = np.ndarray | pd.DataFrame
+
+
+def _resolve_eta_model_configs(cfg: EtaExperimentConfig) -> list[EtaModelConfig]:
+    requested: list[str] = [str(name).strip() for name in cfg.eta_models if str(name).strip()]
+    if len(requested) == 0:
+        raise ValueError("eta_models must be non-empty.")
+
+    if "all" in requested:
+        requested = ["logreg", "svm_rbf", "rf", "mlp", "ffm"]
+    if (
+        cfg.hyperparameter == "fixed"
+        and requested == ["logreg", "svm_rbf", "rf", "mlp"]
+    ):
+        requested = ["logreg"]
+
+    if cfg.hyperparameter == "fixed":
+        base_cfgs: list[EtaModelConfig] = get_fixed_logreg_eta_model_configs(c_value=0.1)
+    else:
+        base_cfgs = (
+            get_reduced_eta_model_configs()
+            if cfg.use_reduced_grid
+            else get_default_eta_model_configs()
+        )
+
+    by_name: dict[str, EtaModelConfig] = {model_cfg.name: model_cfg for model_cfg in base_cfgs}
+    if "ffm" in requested:
+        by_name.update(
+            {
+                model_cfg.name: model_cfg
+                for model_cfg in get_libffm_eta_model_configs(
+                    ffm_train_path=cfg.ffm_train_path,
+                    ffm_predict_path=cfg.ffm_predict_path,
+                    threads=cfg.ffm_threads,
+                    reduced=cfg.use_reduced_grid,
+                )
+            }
+        )
+
+    unknown: list[str] = [name for name in requested if name not in by_name]
+    if unknown:
+        if cfg.hyperparameter == "fixed":
+            raise ValueError(
+                "--hyperparameter fixed only defines logreg C=0.1. "
+                f"Unknown or unavailable eta_models under this setting: {unknown}."
+            )
+        raise ValueError(f"Unknown eta_models: {unknown}.")
+
+    selected: list[EtaModelConfig] = [by_name[name] for name in requested]
+    return selected
 
 
 def _count_csv_rows(csv_path: str, chunksize: int = 1 << 20) -> int:
@@ -765,23 +819,17 @@ def run_eta_model_experiments(
     if len(eps_list) == 0:
         raise ValueError("epsilon_list must be non-empty.")
 
-    if cfg.hyperparameter == "fixed":
-        eta_model_cfgs: list[EtaModelConfig] = get_fixed_logreg_eta_model_configs(c_value=0.1)
-    else:
-        eta_model_cfgs = (
-            get_reduced_eta_model_configs()
-            if cfg.use_reduced_grid
-            else get_default_eta_model_configs()
-        )
+    eta_model_cfgs: list[EtaModelConfig] = _resolve_eta_model_configs(cfg)
 
     logging.info(
-        "analysis=%s selection=%s report_attacks=%s eps=%s reduced_grid=%s hyperparameter=%s",
+        "analysis=%s selection=%s report_attacks=%s eps=%s reduced_grid=%s hyperparameter=%s eta_models=%s",
         cfg.analysis,
         cfg.selection,
         report_attacks,
         eps_list,
         cfg.use_reduced_grid,
         cfg.hyperparameter,
+        [model_cfg.name for model_cfg in eta_model_cfgs],
     )
 
     # ---------- results container (long) ----------
@@ -945,6 +993,7 @@ def run_eta_model_experiments(
 
     # ---------- run seeds x eps ----------
     for seed in tqdm(list(lst_seed), desc="ETA model comparison (per seed, per epsilon)"):
+        indirect_model_cache: dict[str, dict[str, dict[str, object]]] = {}
         for epsilon in eps_list:
             logging.info(
                 "Running eta-model comparison for seed=%s, epsilon=%s",
@@ -952,6 +1001,10 @@ def run_eta_model_experiments(
                 epsilon,
             )
             auditor.set_params(epsilon=float(epsilon), k=cfg.k, random_state=int(seed))
+
+            prefit_cache: dict[str, dict[str, dict[str, object]]] | None = None
+            if "indirect_LRT_hat" in report_attacks and "indirect_LRT_hat" in indirect_model_cache:
+                prefit_cache = {"indirect_LRT_hat": indirect_model_cache["indirect_LRT_hat"]}
 
             out: dict = auditor.run_eta_model_comparison_4way(
                 seed=int(seed),
@@ -964,9 +1017,18 @@ def run_eta_model_experiments(
                 y_train=y_train,
                 X_val=X_val,
                 y_val=y_val,
+                prefit_model_best_by_attack=prefit_cache,  # type: ignore[arg-type]
                 y_alt=cfg.y_alt,
                 y_null=cfg.y_null,
             )
+            model_best_by_attack = cast(
+                dict[str, dict[str, dict[str, object]]],
+                out.get("model_best_by_attack", {}),
+            )
+            if "indirect_LRT_hat" in report_attacks and "indirect_LRT_hat" not in indirect_model_cache:
+                indirect_best: dict[str, dict[str, object]] | None = model_best_by_attack.get("indirect_LRT_hat")
+                if indirect_best is not None:
+                    indirect_model_cache["indirect_LRT_hat"] = indirect_best
             prior_info: dict[str, float] = cast(dict[str, float], out.get("eta_class_prior", {}))
 
             for model_name, info in out["results"].items():
@@ -1013,9 +1075,9 @@ def run_eta_model_experiments(
                 if tau_q_by_attack:
                     for attack_name, tau_q in tau_q_by_attack.items():
                         for metric_name, prior_key in (
-                            ("eta_prior_y0", "pi0"),
-                            ("eta_prior_y1", "pi1"),
-                            ("eta_log_prior_correction", "log_pi0_over_pi1"),
+                            ("eta_prior_y0", "prior_0"),
+                            ("eta_prior_y1", "prior_1"),
+                            ("eta_log_prior_correction", "log_prior_0_over_prior_1"),
                         ):
                             append_row(
                                 seed=int(seed),
@@ -1143,6 +1205,11 @@ def run_eta_model_experiments(
                         params_json=params_json_by_attack.get(str(attack_name)),
                         attack_for_report=str(attack_name),
                     )
+        for per_model_best in indirect_model_cache.values():
+            for best in per_model_best.values():
+                cleanup_model: Any | None = getattr(best.get("model"), "cleanup", None)
+                if callable(cleanup_model):
+                    cleanup_model()
 
     df = pd.DataFrame(rows)
 
@@ -1202,6 +1269,34 @@ if __name__ == "__main__":
         choices=["grid", "fixed"],
         default="grid",
         help="Hyperparameter strategy: grid search (all models) or fixed logreg C=0.1.",
+    )
+    parser.add_argument(
+        "--eta_models",
+        nargs="+",
+        choices=["logreg", "svm_rbf", "rf", "mlp", "ffm", "all"],
+        default=["logreg", "svm_rbf", "rf", "mlp"],
+        help=(
+            "Eta model families to run. Add 'ffm' to use libffm, or use 'all' "
+            "for logreg/svm_rbf/rf/mlp/ffm."
+        ),
+    )
+    parser.add_argument(
+        "--ffm_train_path",
+        type=str,
+        default="ffm-train",
+        help="Path to libffm ffm-train executable, or a command available on PATH.",
+    )
+    parser.add_argument(
+        "--ffm_predict_path",
+        type=str,
+        default="ffm-predict",
+        help="Path to libffm ffm-predict executable, or a command available on PATH.",
+    )
+    parser.add_argument(
+        "--ffm_threads",
+        type=int,
+        default=1,
+        help="Number of threads passed to ffm-train -s. Use 1 for deterministic libffm runs.",
     )
     parser.add_argument("--sim_d", type=int, default=2)
     parser.add_argument("--sim_sigma", type=float, default=1.0)
@@ -1283,6 +1378,10 @@ if __name__ == "__main__":
         evaluate_both_reports=bool(args.evaluate_both_reports),
         use_reduced_grid=bool(args.use_reduced_grid),
         hyperparameter=cast(Literal["grid", "fixed"], args.hyperparameter),
+        eta_models=tuple(str(name) for name in args.eta_models),
+        ffm_train_path=str(args.ffm_train_path),
+        ffm_predict_path=str(args.ffm_predict_path),
+        ffm_threads=int(args.ffm_threads),
         sim_d=args.sim_d,
         sim_sigma=args.sim_sigma,
         sim_mean_shift=args.sim_mean_shift,
@@ -1413,3 +1512,16 @@ if __name__ == "__main__":
 #   --seed_start 0 \
 #   --seed_end 1 \
 #   --score_dist
+
+# python experiment_eta_model.py \
+#   --real_data \
+#   --real_data_path ./data/avazu/avazu_train_label_first.csv \
+#   --real_data_name Avazu \
+#   --output_root ./results/20260401 \
+#   --evaluate_both_reports \
+#   --eta_models ffm \
+#   --use_reduced_grid \
+#   --N_total 100000 \
+#   --N_ratio 0.2,0.2,0.6 \
+#   --seed_start 0 \
+#   --seed_end 1

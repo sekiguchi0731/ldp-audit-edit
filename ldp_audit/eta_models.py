@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+from typing import Any, Callable, Iterator, Sequence
 
 import numpy as np
 import pandas as pd
@@ -31,6 +35,254 @@ class EtaModelConfig:
     param_grid: Sequence[dict[str, Any]]
     needs_scaling: bool
     builder: Callable[[dict[str, Any], int], Any]  # (params, seed) -> estimator
+    direct_input: bool = False
+
+
+class LibFFMClassifier:
+    """
+    sklearn-like wrapper around the libffm command-line tools.
+
+    The wrapper owns the conversion from DataFrame/ndarray rows to libffm's
+    `<label> <field>:<feature>:<value> ...` format so callers can continue
+    passing the same real-data splits used by the sklearn models.
+    """
+
+    def __init__(
+        self,
+        *,
+        ffm_train_path: str = "ffm-train",
+        ffm_predict_path: str = "ffm-predict",
+        lambda_: float = 2e-5,
+        k: int = 4,
+        iterations: int = 15,
+        eta: float = 0.2,
+        threads: int = 1,
+        auto_stop: bool = True,
+        no_norm: bool = False,
+        quiet: bool = True,
+        keep_tmp: bool = False,
+        seed: int | None = None,
+    ) -> None:
+        self.ffm_train_path: str = ffm_train_path
+        self.ffm_predict_path: str = ffm_predict_path
+        self.lambda_ = float(lambda_)
+        self.k = int(k)
+        self.iterations = int(iterations)
+        self.eta = float(eta)
+        self.threads = int(threads)
+        self.auto_stop = bool(auto_stop)
+        self.no_norm = bool(no_norm)
+        self.quiet = bool(quiet)
+        self.keep_tmp = bool(keep_tmp)
+        self.seed: int | None = seed
+
+        self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
+        self._model_path: Path | None = None
+        self._feature_to_id: dict[tuple[str, str], int] = {}
+        self._numeric_feature_to_id: dict[str, int] = {}
+        self._field_to_id: dict[str, int] = {}
+        self._feature_names: list[str] | None = None
+        self._is_fitted: bool = False
+        self._predict_counter: int = 0
+
+    def fit(self, X: np.ndarray | pd.DataFrame, y: np.ndarray) -> "LibFFMClassifier":
+        return self.fit_with_validation(X, y, None, None)
+
+    def fit_with_validation(
+        self,
+        X: np.ndarray | pd.DataFrame,
+        y: np.ndarray,
+        X_val: np.ndarray | pd.DataFrame | None,
+        y_val: np.ndarray | None,
+    ) -> "LibFFMClassifier":
+        train_exe: str | None = shutil.which(self.ffm_train_path) if not Path(self.ffm_train_path).exists() else self.ffm_train_path
+        predict_exe: str | None = (
+            shutil.which(self.ffm_predict_path)
+            if not Path(self.ffm_predict_path).exists()
+            else self.ffm_predict_path
+        )
+        if train_exe is None:
+            raise FileNotFoundError(
+                "ffm-train was not found. Install/build libffm and pass --ffm_train_path "
+                "or put ffm-train on PATH."
+            )
+        if predict_exe is None:
+            raise FileNotFoundError(
+                "ffm-predict was not found. Install/build libffm and pass --ffm_predict_path "
+                "or put ffm-predict on PATH."
+            )
+        self.ffm_train_path = str(train_exe)
+        self.ffm_predict_path = str(predict_exe)
+
+        self._reset_feature_state(X)
+        self._tmpdir = tempfile.TemporaryDirectory(prefix="ldp_audit_libffm_")
+        tmp_path = Path(self._tmpdir.name)
+        train_path: Path = tmp_path / "train.ffm"
+        model_path: Path = tmp_path / "model.ffm"
+        self._model_path = model_path
+        self._write_ffm_file(train_path, X, y, fit=True)
+
+        cmd: list[str] = [
+            self.ffm_train_path,
+            "-l",
+            str(self.lambda_),
+            "-k",
+            str(self.k),
+            "-t",
+            str(self.iterations),
+            "-r",
+            str(self.eta),
+            "-s",
+            str(self.threads),
+        ]
+        if self.quiet:
+            cmd.append("--quiet")
+        if self.no_norm:
+            cmd.append("--no-norm")
+
+        if X_val is not None and y_val is not None:
+            val_path: Path = tmp_path / "validation.ffm"
+            self._write_ffm_file(val_path, X_val, y_val, fit=False)
+            cmd.extend(["-p", str(val_path)])
+            if self.auto_stop:
+                cmd.append("--auto-stop")
+
+        cmd.extend([str(train_path), str(model_path)])
+        subprocess.run(cmd, check=True, capture_output=self.quiet, text=True, cwd=tmp_path)
+        self._is_fitted = True
+        return self
+
+    def predict_proba(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
+        if not self._is_fitted or self._tmpdir is None or self._model_path is None:
+            raise RuntimeError("LibFFMClassifier must be fitted before predict_proba.")
+
+        tmp_path = Path(self._tmpdir.name)
+        self._predict_counter += 1
+        test_path: Path = tmp_path / f"predict_{self._predict_counter}.ffm"
+        output_path: Path = tmp_path / f"predict_{self._predict_counter}.out"
+        dummy_y: np.ndarray = np.zeros(self._num_rows(X), dtype=np.int64)
+        self._write_ffm_file(test_path, X, dummy_y, fit=False)
+
+        subprocess.run(
+            [self.ffm_predict_path, str(test_path), str(self._model_path), str(output_path)],
+            check=True,
+            capture_output=self.quiet,
+            text=True,
+            cwd=tmp_path,
+        )
+        p1: np.ndarray = np.loadtxt(output_path, dtype=np.float64)
+        p1 = np.atleast_1d(p1)
+        p1 = clip_eta(p1)
+        return np.column_stack([1.0 - p1, p1])
+
+    def cleanup(self) -> None:
+        if self.keep_tmp:
+            return
+        if self._tmpdir is not None:
+            self._tmpdir.cleanup()
+            self._tmpdir = None
+
+    def __del__(self) -> None:
+        try:
+            self.cleanup()
+        except Exception:
+            pass
+
+    def _reset_feature_state(self, X: np.ndarray | pd.DataFrame) -> None:
+        self._feature_to_id = {}
+        self._numeric_feature_to_id = {}
+        self._field_to_id = {}
+        self._feature_names = self._get_feature_names(X)
+
+    def _get_feature_names(self, X: np.ndarray | pd.DataFrame) -> list[str]:
+        if isinstance(X, pd.DataFrame):
+            return [str(col) for col in X.columns]
+        if X.ndim != 2:
+            raise ValueError(f"X must be 2-dimensional, got shape={X.shape}.")
+        return [f"f{idx}" for idx in range(X.shape[1])]
+
+    def _num_rows(self, X: np.ndarray | pd.DataFrame) -> int:
+        return int(X.shape[0])
+
+    def _field_id(self, field_name: str) -> int:
+        if field_name not in self._field_to_id:
+            self._field_to_id[field_name] = len(self._field_to_id)
+        return self._field_to_id[field_name]
+
+    def _next_feature_id(self) -> int:
+        return len(self._numeric_feature_to_id) + len(self._feature_to_id)
+
+    def _numeric_feature_id(self, field_name: str) -> int:
+        if field_name not in self._numeric_feature_to_id:
+            self._numeric_feature_to_id[field_name] = self._next_feature_id()
+        return self._numeric_feature_to_id[field_name]
+
+    def _categorical_feature_id(self, field_name: str, value: Any, *, fit: bool) -> int | None:
+        key: tuple[str, str] = (field_name, str(value))
+        if key not in self._feature_to_id:
+            if not fit:
+                return None
+            self._feature_to_id[key] = self._next_feature_id()
+        return self._feature_to_id[key]
+
+    def _iter_rows(self, X: np.ndarray | pd.DataFrame) -> Iterator[list[Any]]:
+        feature_names: list[str] = self._feature_names if self._feature_names is not None else self._get_feature_names(X)
+        if isinstance(X, pd.DataFrame):
+            if [str(col) for col in X.columns] != feature_names:
+                raise ValueError("Prediction DataFrame columns differ from the training columns.")
+            for row in X.itertuples(index=False, name=None):
+                yield list(row)
+            return
+
+        if X.ndim != 2:
+            raise ValueError(f"X must be 2-dimensional, got shape={X.shape}.")
+        if X.shape[1] != len(feature_names):
+            raise ValueError(
+                f"X has {X.shape[1]} columns, but the fitted FFM model expects {len(feature_names)}."
+            )
+        for row_idx in range(X.shape[0]):
+            yield X[row_idx, :].tolist()
+
+    def _format_value(self, value: Any) -> str:
+        return f"{float(value):.12g}"
+
+    def _is_numeric_value(self, value: Any) -> bool:
+        if pd.isna(value):
+            return False
+        return isinstance(value, (int, float, np.integer, np.floating))
+
+    def _write_ffm_file(
+        self,
+        path: Path,
+        X: np.ndarray | pd.DataFrame,
+        y: np.ndarray,
+        *,
+        fit: bool,
+    ) -> None:
+        y_arr: np.ndarray = np.asarray(y)
+        if y_arr.shape[0] != self._num_rows(X):
+            raise ValueError(f"X/y length mismatch: X has {self._num_rows(X)} rows, y has {y_arr.shape[0]}.")
+        feature_names: list[str] = self._feature_names if self._feature_names is not None else self._get_feature_names(X)
+
+        with path.open("w", encoding="utf-8") as f:
+            for label, row_values in zip(y_arr, self._iter_rows(X)):
+                parts: list[str] = [str(int(label))]
+                for field_name, raw_value in zip(feature_names, row_values):
+                    if pd.isna(raw_value):
+                        continue
+                    field_id: int = self._field_id(field_name)
+                    if self._is_numeric_value(raw_value):
+                        value: float = float(raw_value)
+                        if value == 0.0:
+                            continue
+                        feature_id: int | None = self._numeric_feature_id(field_name)
+                        parts.append(f"{field_id}:{feature_id}:{self._format_value(value)}")
+                    else:
+                        feature_id = self._categorical_feature_id(field_name, raw_value, fit=fit)
+                        if feature_id is not None:
+                            parts.append(f"{field_id}:{feature_id}:1")
+                f.write(" ".join(parts))
+                f.write("\n")
 
 
 def _build_logreg(params: dict[str, Any], seed: int) -> LogisticRegression:
@@ -74,6 +326,11 @@ def _build_mlp(params: dict[str, Any], seed: int) -> MLPClassifier:
         n_iter_no_change=20,
         **params,
     )
+
+
+def _build_libffm(params: dict[str, Any], seed: int) -> LibFFMClassifier:
+    print("Building libffm FFM with params:", params)
+    return LibFFMClassifier(seed=seed, **params)
 
 
 def _build_real_data_preprocessor(
@@ -123,7 +380,7 @@ def make_eta_pipeline(
     params: dict[str, Any],
     seed: int,
     X_sample: np.ndarray | pd.DataFrame | None = None,
-) -> Pipeline:
+) -> Any:
     """
     Build an sklearn Pipeline for eta(x)=P(Y=1|X=x) estimation.
 
@@ -131,7 +388,9 @@ def make_eta_pipeline(
     feature standardization before the classifier and returns a unified
     Pipeline with ``fit``/``predict_proba`` interface.
     """
-    est: LogisticRegression | SVC | RandomForestClassifier | MLPClassifier = cfg.builder(params, seed)
+    est: Any = cfg.builder(params, seed)
+    if cfg.direct_input:
+        return est
     if isinstance(X_sample, pd.DataFrame):
         return Pipeline(
             [
@@ -230,6 +489,54 @@ def get_reduced_eta_model_configs() -> list[EtaModelConfig]:
     ]
 
 
+def get_libffm_eta_model_configs(
+    *,
+    ffm_train_path: str = "ffm-train",
+    ffm_predict_path: str = "ffm-predict",
+    threads: int = 1,
+    reduced: bool = True,
+) -> list[EtaModelConfig]:
+    """
+    FFM configs backed by libffm's ffm-train/ffm-predict CLI.
+
+    The grid intentionally stays compact because each candidate launches an
+    external training process and Avazu/Criteo feature spaces are large.
+    """
+    if reduced:
+        ffm_grid: list[dict[str, Any]] = [
+            {
+                "lambda_": lambda_,
+                "k": 4,
+                "iterations": 30,
+                "eta": eta,
+                "threads": int(threads),
+                "auto_stop": True,
+                "ffm_train_path": ffm_train_path,
+                "ffm_predict_path": ffm_predict_path,
+            }
+            for lambda_ in [2e-5, 1e-4]
+            for eta in [0.05, 0.2]
+        ]
+    else:
+        ffm_grid = [
+            {
+                "lambda_": lambda_,
+                "k": k,
+                "iterations": iterations,
+                "eta": eta,
+                "threads": int(threads),
+                "auto_stop": True,
+                "ffm_train_path": ffm_train_path,
+                "ffm_predict_path": ffm_predict_path,
+            }
+            for lambda_ in [2e-5, 1e-4, 1e-3]
+            for k in [4, 8]
+            for iterations in [15, 30]
+            for eta in [0.05, 0.2]
+        ]
+    return [EtaModelConfig("ffm", ffm_grid, False, _build_libffm, direct_input=True)]
+
+
 def get_fixed_logreg_eta_model_configs(c_value: float = 0.1) -> list[EtaModelConfig]:
     """
     Fixed hyperparameter setting for logistic regression only.
@@ -253,7 +560,7 @@ def fit_and_select_eta_model(
     X_val: np.ndarray | pd.DataFrame,
     y_val: np.ndarray,
     seed: int,
-    score_fn: Callable[[Pipeline], float],
+    score_fn: Callable[[Any], float],
 ) -> dict[str, Any]:
     """
     Fit+select best hyperparameters for ONE model family.
@@ -270,16 +577,28 @@ def fit_and_select_eta_model(
     }
 
     for params in cfg.param_grid:
-        model: Pipeline = make_eta_pipeline(cfg, params, seed=seed, X_sample=X_train)
-        model.fit(X_train, y_train)
+        model: Any = make_eta_pipeline(cfg, params, seed=seed, X_sample=X_train)
+        fit_with_validation: Any | None = getattr(model, "fit_with_validation", None)
+        if callable(fit_with_validation):
+            fit_with_validation(X_train, y_train, X_val, y_val)
+        else:
+            model.fit(X_train, y_train)
         s = float(score_fn(model))
         if s > best["score"]:
+            previous_best_model: Any | None = best.get("model")
+            cleanup_previous_best: Any | None = getattr(previous_best_model, "cleanup", None)
+            if callable(cleanup_previous_best):
+                cleanup_previous_best()
             best = {
                 "score": s,
                 "params": dict(params),
                 "model": model,
                 "cfg_name": cfg.name,
             }
+        else:
+            cleanup_model = getattr(model, "cleanup", None)
+            if callable(cleanup_model):
+                cleanup_model()
 
     if best["model"] is None:
         raise RuntimeError(f"Failed to select model for cfg={cfg.name}")
