@@ -69,9 +69,11 @@ class EtaExperimentConfig:
     sim_rmax_alpha: float = 1e-6
     sim_n_train: int = 4000
     sim_n_val: int = 2000
+    sim_n_threshold: int = 2000
     n_total: int | None = None
     ratio_train: float | None = None
     ratio_val: float | None = None
+    ratio_threshold: float | None = None
     ratio_final: float | None = None
     real_data_name: str | None = None
     collect_score_distribution: bool = False
@@ -160,20 +162,27 @@ def _parse_n_total_arg(
     return int(raw_value)
 
 
-def _validate_ratio_triplet(ratio: Sequence[float]) -> tuple[float, float, float]:
-    if len(ratio) != 3:
-        raise ValueError(f"N_ratio must contain exactly 3 values, got {ratio}.")
-    r_train, r_val, r_final = (float(r) for r in ratio)
-    if min(r_train, r_val, r_final) <= 0.0:
+def _validate_ratio_values(ratio: Sequence[float]) -> tuple[float, float, float, float]:
+    if len(ratio) == 3:
+        r_train, r_val, r_final = (float(r) for r in ratio)
+        if min(r_train, r_val, r_final) <= 0.0:
+            raise ValueError(f"N_ratio values must be positive, got {ratio}.")
+        if not np.isclose(r_train + r_val + r_final, 1.0, atol=1e-8):
+            raise ValueError(f"N_ratio must sum to 1.0, got {ratio}.")
+        return r_train, r_val / 2.0, r_val / 2.0, r_final
+    if len(ratio) != 4:
+        raise ValueError(f"N_ratio must contain 4 values (train, model_val, threshold, final), got {ratio}.")
+    r_train, r_val, r_threshold, r_final = (float(r) for r in ratio)
+    if min(r_train, r_val, r_threshold, r_final) <= 0.0:
         raise ValueError(f"N_ratio values must be positive, got {ratio}.")
-    if not np.isclose(r_train + r_val + r_final, 1.0, atol=1e-8):
+    if not np.isclose(r_train + r_val + r_threshold + r_final, 1.0, atol=1e-8):
         raise ValueError(f"N_ratio must sum to 1.0, got {ratio}.")
-    return r_train, r_val, r_final
+    return r_train, r_val, r_threshold, r_final
 
 
 def _parse_n_ratio_args(
     raw_values: Sequence[str] | None,
-) -> list[tuple[float, float, float]] | None:
+) -> list[tuple[float, float, float, float]] | None:
     if raw_values is None or len(raw_values) == 0:
         return None
 
@@ -182,25 +191,26 @@ def _parse_n_ratio_args(
         parsed = ast.literal_eval(text)
         if (
             isinstance(parsed, tuple)
-            and len(parsed) == 3
+            and len(parsed) in (3, 4)
             and all(isinstance(v, (int, float)) for v in parsed)
         ):
-            return [_validate_ratio_triplet(tuple(float(v) for v in parsed))]
+            return [_validate_ratio_values(tuple(float(v) for v in parsed))]
         if not isinstance(parsed, (list, tuple)):
             raise ValueError(f"Could not parse N_ratio from: {text}")
         return [
-            _validate_ratio_triplet(tuple(float(v) for v in item)) for item in parsed
+            _validate_ratio_values(tuple(float(v) for v in item)) for item in parsed
         ]
 
-    ratios: list[tuple[float, float, float]] = []
+    ratios: list[tuple[float, float, float, float]] = []
     for token in raw_values:
         cleaned: str = token.strip().strip("[]()")
         parts: list[str] = [p.strip() for p in cleaned.split(",") if p.strip()]
-        if len(parts) != 3:
+        if len(parts) not in (3, 4):
             raise ValueError(
-                f"Each N_ratio token must look like '0.1,0.1,0.8'. Got: {token}"
+                "Each N_ratio token must look like '0.2,0.2,0.2,0.4' "
+                f"for (train, model_val, threshold, final). Got: {token}"
             )
-        ratios.append(_validate_ratio_triplet(tuple(float(p) for p in parts)))
+        ratios.append(_validate_ratio_values(tuple(float(p) for p in parts)))
     return ratios
 
 
@@ -306,12 +316,13 @@ def _save_indirect_score_distributions(
 def _resolve_count_plan(
     *,
     n_total: int,
-    ratio: tuple[float, float, float],
+    ratio: tuple[float, float, float, float],
     nb_trials_override: int | None,
     sim_n_train_override: int | None,
     sim_n_val_override: int | None,
-) -> tuple[int, int, int]:
-    ratio_train, ratio_val, ratio_final = ratio
+    sim_n_threshold_override: int | None,
+) -> tuple[int, int, int, int]:
+    ratio_train, ratio_val, ratio_threshold, ratio_final = ratio
 
     sim_n_train: int = (
         int(sim_n_train_override)
@@ -323,29 +334,40 @@ def _resolve_count_plan(
         if sim_n_val_override is not None
         else int(round(n_total * ratio_val))
     )
+    sim_n_threshold: int = (
+        int(sim_n_threshold_override)
+        if sim_n_threshold_override is not None
+        else int(round(n_total * ratio_threshold))
+    )
     if nb_trials_override is not None:
         nb_trials = int(nb_trials_override)
-    elif sim_n_train_override is None and sim_n_val_override is None:
-        nb_trials = int(n_total - sim_n_train - sim_n_val)
+    elif (
+        sim_n_train_override is None
+        and sim_n_val_override is None
+        and sim_n_threshold_override is None
+    ):
+        nb_trials = int(n_total - sim_n_train - sim_n_val - sim_n_threshold)
     else:
         nb_trials = int(round(n_total * ratio_final))
 
-    if min(sim_n_train, sim_n_val, nb_trials) <= 0:
+    if min(sim_n_train, sim_n_val, sim_n_threshold, nb_trials) <= 0:
         raise ValueError(
             "Resolved counts must be positive. "
-            f"Got sim_n_train={sim_n_train}, sim_n_val={sim_n_val}, nb_trials={nb_trials}."
+            f"Got sim_n_train={sim_n_train}, sim_n_val={sim_n_val}, "
+            f"sim_n_threshold={sim_n_threshold}, nb_trials={nb_trials}."
         )
-    return sim_n_train, sim_n_val, nb_trials
+    return sim_n_train, sim_n_val, sim_n_threshold, nb_trials
 
 
 def _build_ratio_cfgs(
     *,
     base_cfg: EtaExperimentConfig,
     n_total: int | None,
-    ratios: list[tuple[float, float, float]] | None,
+    ratios: list[tuple[float, float, float, float]] | None,
     nb_trials_override: int | None,
     sim_n_train_override: int | None,
     sim_n_val_override: int | None,
+    sim_n_threshold_override: int | None,
 ) -> list[EtaExperimentConfig]:
     if n_total is None:
         return [base_cfg]
@@ -355,25 +377,28 @@ def _build_ratio_cfgs(
             nb_trials_override is not None
             and sim_n_train_override is not None
             and sim_n_val_override is not None
+            and sim_n_threshold_override is not None
         ):
             return [replace(base_cfg, n_total=int(n_total))]
         raise ValueError(
-            "When N_total is set, N_ratio must also be set unless all three counts are explicitly overridden."
+            "When N_total is set, N_ratio must also be set unless all four counts are explicitly overridden."
         )
 
     cfgs: list[EtaExperimentConfig] = []
     for ratio in ratios:
-        ratio_train, ratio_val, ratio_final = ratio
-        sim_n_train, sim_n_val, nb_trials = _resolve_count_plan(
+        ratio_train, ratio_val, ratio_threshold, ratio_final = ratio
+        sim_n_train, sim_n_val, sim_n_threshold, nb_trials = _resolve_count_plan(
             n_total=int(n_total),
             ratio=ratio,
             nb_trials_override=nb_trials_override,
             sim_n_train_override=sim_n_train_override,
             sim_n_val_override=sim_n_val_override,
+            sim_n_threshold_override=sim_n_threshold_override,
         )
         analysis_suffix: str = (
             f"_Ntotal={int(n_total)}"
-            f"_r={_format_ratio_for_path(ratio_train)}-{_format_ratio_for_path(ratio_val)}-{_format_ratio_for_path(ratio_final)}"
+            f"_r={_format_ratio_for_path(ratio_train)}-{_format_ratio_for_path(ratio_val)}"
+            f"-{_format_ratio_for_path(ratio_threshold)}-{_format_ratio_for_path(ratio_final)}"
         )
         cfgs.append(
             replace(
@@ -381,9 +406,11 @@ def _build_ratio_cfgs(
                 nb_trials=nb_trials,
                 sim_n_train=sim_n_train,
                 sim_n_val=sim_n_val,
+                sim_n_threshold=sim_n_threshold,
                 n_total=int(n_total),
                 ratio_train=ratio_train,
                 ratio_val=ratio_val,
+                ratio_threshold=ratio_threshold,
                 ratio_final=ratio_final,
                 analysis=f"{base_cfg.analysis}{analysis_suffix}",
             )
@@ -657,11 +684,21 @@ def load_susy_real_data_split(
     csv_path: str,
     n_train: int,
     n_val: int,
+    n_threshold: int,
     n_final: int,
     seed: int,
     real_data_name: str | None = None,
-) -> tuple[FeatureMatrix, np.ndarray, FeatureMatrix, np.ndarray, FeatureMatrix, np.ndarray]:
-    n_total = int(n_train + n_val + n_final)
+) -> tuple[
+    FeatureMatrix,
+    np.ndarray,
+    FeatureMatrix,
+    np.ndarray,
+    FeatureMatrix,
+    np.ndarray,
+    FeatureMatrix,
+    np.ndarray,
+]:
+    n_total = int(n_train + n_val + n_threshold + n_final)
     total_rows: int = _count_csv_rows(csv_path)
     logging.info(f"[load_susy] total_rows={total_rows}, requested={n_total}")
     feature_kinds: list[str] = _infer_real_csv_feature_kinds(
@@ -718,14 +755,21 @@ def load_susy_real_data_split(
         stratify=y,
         random_state=int(seed),
     )
-    X_val, X_final, y_val, y_final = train_test_split(
+    X_val, X_rest2, y_val, y_rest2 = train_test_split(
         X_rest,
         y_rest,
         train_size=int(n_val),
         stratify=y_rest,
         random_state=int(seed) + 1,
     )
-    return X_train, y_train, X_val, y_val, X_final, y_final
+    X_threshold, X_final, y_threshold, y_final = train_test_split(
+        X_rest2,
+        y_rest2,
+        train_size=int(n_threshold),
+        stratify=y_rest2,
+        random_state=int(seed) + 2,
+    )
+    return X_train, y_train, X_val, y_val, X_threshold, y_threshold, X_final, y_final
 
 
 def _append_metric(
@@ -747,9 +791,11 @@ def _append_metric(
     sim_mean_shift: float | None,
     sim_n_train: int | None,
     sim_n_val: int | None,
+    sim_n_threshold: int | None,
     n_total: int | None,
     ratio_train: float | None,
     ratio_val: float | None,
+    ratio_threshold: float | None,
     ratio_final: float | None,
     metric: str,
     value: float | int | None,
@@ -774,9 +820,11 @@ def _append_metric(
     rows["sim_mean_shift"].append(sim_mean_shift)
     rows["sim_n_train"].append(sim_n_train)
     rows["sim_n_val"].append(sim_n_val)
+    rows["sim_n_threshold"].append(sim_n_threshold)
     rows["n_total"].append(n_total)
     rows["ratio_train"].append(ratio_train)
     rows["ratio_val"].append(ratio_val)
+    rows["ratio_threshold"].append(ratio_threshold)
     rows["ratio_final"].append(ratio_final)
 
     rows["metric"].append(metric)
@@ -793,6 +841,8 @@ def run_eta_model_experiments(
     y_train: np.ndarray | None = None,
     X_val: FeatureMatrix | None = None,
     y_val: np.ndarray | None = None,
+    X_threshold: FeatureMatrix | None = None,
+    y_threshold: np.ndarray | None = None,
     X_final: FeatureMatrix | None = None,
     y_final: np.ndarray | None = None,
 ) -> pd.DataFrame:
@@ -807,7 +857,7 @@ def run_eta_model_experiments(
 
     Notes:
         - In simulation mode, it internally generates attackers' auxiliary labeled data.
-        - In real-data mode, pass X_train,y_train,X_val,y_val,X_final,y_final. (labels must be 0/1)
+        - In real-data mode, pass X_train/y_train, X_val/y_val, X_threshold/y_threshold, X_final/y_final.
     """
     logging.info("=== run_eta_model_experiments ===")
     report_attacks: tuple[Literal["indirect_LRT_hat", "complete_LRT_hat"], ...] = (
@@ -850,9 +900,11 @@ def run_eta_model_experiments(
         "sim_mean_shift": [],
         "sim_n_train": [],
         "sim_n_val": [],
+        "sim_n_threshold": [],
         "n_total": [],
         "ratio_train": [],
         "ratio_val": [],
+        "ratio_threshold": [],
         "ratio_final": [],
         "metric": [],
         "value": [],
@@ -876,10 +928,18 @@ def run_eta_model_experiments(
             sim_mean_shift=cfg.sim_mean_shift,
             sim_n_train=cfg.sim_n_train,
             sim_n_val=cfg.sim_n_val,
+            sim_n_threshold=cfg.sim_n_threshold,
         )
     else:
-        if X_val is None or y_val is None or X_final is None or y_final is None:
-            raise ValueError("Real-data mode requires X_val/y_val/X_final/y_final.")
+        if (
+            X_val is None
+            or y_val is None
+            or X_threshold is None
+            or y_threshold is None
+            or X_final is None
+            or y_final is None
+        ):
+            raise ValueError("Real-data mode requires X_val/y_val/X_threshold/y_threshold/X_final/y_final.")
         d_real = int(X_train.shape[1])
         # dummy spec (won't be used for train/val generation in real mode)
         spec = MixtureSpec(num_classes=2, d=d_real, sigma=1.0, mean_shift=1.0)
@@ -896,6 +956,7 @@ def run_eta_model_experiments(
             sim_mean_shift=None,
             sim_n_train=X_train.shape[0],
             sim_n_val=X_val.shape[0],
+            sim_n_threshold=X_threshold.shape[0],
         )
 
     sim_d_row: int = int(sim_meta["sim_d"] if sim_meta["sim_d"] is not None else -1)
@@ -903,6 +964,9 @@ def run_eta_model_experiments(
     sim_mean_shift_row: float | None = sim_meta["sim_mean_shift"]
     sim_n_train_row: int = int(sim_meta["sim_n_train"] if sim_meta["sim_n_train"] is not None else -1)
     sim_n_val_row: int = int(sim_meta["sim_n_val"] if sim_meta["sim_n_val"] is not None else -1)
+    sim_n_threshold_row: int = int(
+        sim_meta["sim_n_threshold"] if sim_meta["sim_n_threshold"] is not None else -1
+    )
     output_root: Path = Path(cfg.output_root)
     dist_output_dir: Path = output_root / "score_distributions"
     score_dist_data_name: str = cfg.real_data_name or "real"
@@ -936,9 +1000,11 @@ def run_eta_model_experiments(
             sim_mean_shift=sim_mean_shift_row,
             sim_n_train=sim_n_train_row,
             sim_n_val=sim_n_val_row,
+            sim_n_threshold=sim_n_threshold_row,
             n_total=cfg.n_total,
             ratio_train=cfg.ratio_train,
             ratio_val=cfg.ratio_val,
+            ratio_threshold=cfg.ratio_threshold,
             ratio_final=cfg.ratio_final,
             metric=metric,
             value=value,
@@ -960,6 +1026,8 @@ def run_eta_model_experiments(
         sim_hat=(X_train is None),
         real_val_X=X_val,
         real_val_y=y_val,
+        real_threshold_X=X_threshold,
+        real_threshold_y=y_threshold,
         real_final_X=X_final,
         real_final_y=y_final,
         eta_class_prior=eta_class_prior,
@@ -1013,10 +1081,13 @@ def run_eta_model_experiments(
                 eta_model_cfgs=eta_model_cfgs,
                 sim_n_train=cfg.sim_n_train if X_train is None else None,
                 sim_n_val=cfg.sim_n_val if X_train is None else None,
+                sim_n_threshold=cfg.sim_n_threshold if X_train is None else None,
                 X_train=X_train,
                 y_train=y_train,
                 X_val=X_val,
                 y_val=y_val,
+                X_threshold=X_threshold,
+                y_threshold=y_threshold,
                 prefit_model_best_by_attack=prefit_cache,  # type: ignore[arg-type]
                 y_alt=cfg.y_alt,
                 y_null=cfg.y_null,
@@ -1216,13 +1287,15 @@ def run_eta_model_experiments(
     if X_train is None:
         out_csv: str = (
             f"{output_root}/eta_hat_shift={cfg.sim_mean_shift}_c={cfg.c}"
-            f"_f={cfg.nb_trials}_t={cfg.sim_n_train}_v={cfg.sim_n_val}_d={cfg.sim_d}.csv"
+            f"_f={cfg.nb_trials}_t={cfg.sim_n_train}_v={cfg.sim_n_val}"
+            f"_th={cfg.sim_n_threshold}_d={cfg.sim_d}.csv"
         )
     else:
         data_name: str = cfg.real_data_name or "real"
         out_csv = (
             f"{output_root}/eta_hat_{data_name}_c={cfg.c}"
-            f"_f={cfg.nb_trials}_t={X_train.shape[0]}_v={X_val.shape[0]}_d={X_train.shape[1]}.csv" # type: ignore
+            f"_f={cfg.nb_trials}_t={X_train.shape[0]}_v={X_val.shape[0]}" if X_val is not None else ""
+            f"_th={X_threshold.shape[0]}_d={X_train.shape[1]}.csv" # type: ignore
         )
     logging.info("Saving eta-model results to %s", out_csv)
     Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
@@ -1304,6 +1377,7 @@ if __name__ == "__main__":
     parser.add_argument("--sim_rmax_alpha", type=float, default=1e-6)
     parser.add_argument("--sim_n_train", type=int, default=None)
     parser.add_argument("--sim_n_val", type=int, default=None)
+    parser.add_argument("--sim_n_threshold", type=int, default=None)
     parser.add_argument("--real_data", action="store_true")
     parser.add_argument(
         "--real_data_path",
@@ -1326,9 +1400,11 @@ if __name__ == "__main__":
         nargs="*",
         default=None,
         help=(
-            "Ratio settings for (train, val, final). "
-            "Examples: --N_ratio 0.1,0.1,0.8 0.15,0.15,0.7 "
-            "or --N_ratio '[(0.1,0.1,0.8),(0.15,0.15,0.7)]'"
+            "Ratio settings for (train, model_val, threshold, final). "
+            "Example: --N_ratio 0.2,0.2,0.2,0.4 "
+            "or --N_ratio '[(0.2,0.2,0.2,0.4),(0.1,0.2,0.2,0.5)]'. "
+            "Legacy 3-value ratios are accepted by splitting the old validation share "
+            "into model_val and threshold."
         ),
     )
     parser.add_argument(
@@ -1350,10 +1426,10 @@ if __name__ == "__main__":
     if (
         args.N_total is not None
         and str(args.N_total).strip().lower() == "all"
-        and any(v is not None for v in (args.nb_trials, args.sim_n_train, args.sim_n_val))
+        and any(v is not None for v in (args.nb_trials, args.sim_n_train, args.sim_n_val, args.sim_n_threshold))
     ):
         raise ValueError(
-            "When --N_total all is used, do not also specify --nb_trials/--sim_n_train/--sim_n_val."
+            "When --N_total all is used, do not also specify --nb_trials/--sim_n_train/--sim_n_val/--sim_n_threshold."
         )
 
     n_total_value: int | None = _parse_n_total_arg(
@@ -1361,7 +1437,7 @@ if __name__ == "__main__":
         real_data=bool(args.real_data),
         real_data_path=str(args.real_data_path),
     )
-    n_ratio_list: list[tuple[float, float, float]] | None = _parse_n_ratio_args(args.N_ratio)
+    n_ratio_list: list[tuple[float, float, float, float]] | None = _parse_n_ratio_args(args.N_ratio)
     collect_score_distribution: bool = bool(args.score_dist and args.real_data)
     if args.score_dist and not args.real_data:
         logging.info("Ignoring --score_dist because score distributions are saved only with --real_data.")
@@ -1388,6 +1464,13 @@ if __name__ == "__main__":
         sim_rmax_alpha=args.sim_rmax_alpha,
         sim_n_train=int(args.sim_n_train) if args.sim_n_train is not None else 2000,
         sim_n_val=int(args.sim_n_val) if args.sim_n_val is not None else 2000,
+        sim_n_threshold=(
+            int(args.sim_n_threshold)
+            if args.sim_n_threshold is not None
+            else int(args.sim_n_val)
+            if args.sim_n_val is not None
+            else 2000
+        ),
         real_data_name=args.real_data_name if args.real_data else None,
         collect_score_distribution=collect_score_distribution,
         analysis=args.analysis,
@@ -1402,11 +1485,12 @@ if __name__ == "__main__":
         nb_trials_override=args.nb_trials,
         sim_n_train_override=args.sim_n_train,
         sim_n_val_override=args.sim_n_val,
+        sim_n_threshold_override=args.sim_n_threshold,
     )
 
     for cfg in cfgs:
         if cfg.n_total is not None:
-            effective_total: int = cfg.nb_trials + cfg.sim_n_train + cfg.sim_n_val
+            effective_total: int = cfg.nb_trials + cfg.sim_n_train + cfg.sim_n_val + cfg.sim_n_threshold
             if effective_total != int(cfg.n_total):
                 logging.warning(
                     "Effective total (%s) does not match N_total (%s) because explicit overrides were applied.",
@@ -1414,10 +1498,11 @@ if __name__ == "__main__":
                     cfg.n_total,
                 )
         if args.real_data:
-            X_train, y_train, X_val, y_val, X_final, y_final = load_susy_real_data_split(
+            X_train, y_train, X_val, y_val, X_threshold, y_threshold, X_final, y_final = load_susy_real_data_split(
                 csv_path=args.real_data_path,
                 n_train=int(cfg.sim_n_train),
                 n_val=int(cfg.sim_n_val),
+                n_threshold=int(cfg.sim_n_threshold),
                 n_final=int(cfg.nb_trials),
                 seed=int(args.real_data_seed),
                 real_data_name=args.real_data_name,
@@ -1429,6 +1514,8 @@ if __name__ == "__main__":
                 y_train=y_train,
                 X_val=X_val,
                 y_val=y_val,
+                X_threshold=X_threshold,
+                y_threshold=y_threshold,
                 X_final=X_final,
                 y_final=y_final,
             )

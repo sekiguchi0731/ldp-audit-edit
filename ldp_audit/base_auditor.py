@@ -119,6 +119,8 @@ class LDPAuditor:
         sim_hat: bool = True,
         real_val_X: FeatureMatrix | None = None,
         real_val_y: np.ndarray | None = None,
+        real_threshold_X: FeatureMatrix | None = None,
+        real_threshold_y: np.ndarray | None = None,
         real_final_X: FeatureMatrix | None = None,
         real_final_y: np.ndarray | None = None,
         eta_class_prior: tuple[float, float] | None = None,
@@ -188,6 +190,8 @@ class LDPAuditor:
         self.sim_hat: bool = bool(sim_hat)
         self.real_val_X: FeatureMatrix | None = real_val_X
         self.real_val_y: np.ndarray | None = real_val_y
+        self.real_threshold_X: FeatureMatrix | None = real_threshold_X
+        self.real_threshold_y: np.ndarray | None = real_threshold_y
         self.real_final_X: FeatureMatrix | None = real_final_X
         self.real_final_y: np.ndarray | None = real_final_y
         self.eta_class_prior: tuple[float, float] | None = self._validate_eta_class_prior(
@@ -198,11 +202,14 @@ class LDPAuditor:
             if (
                 self.real_val_X is None
                 or self.real_val_y is None
+                or self.real_threshold_X is None
+                or self.real_threshold_y is None
                 or self.real_final_X is None
                 or self.real_final_y is None
             ):
                 raise ValueError(
-                    "When sim_hat=False, real_val_X/real_val_y/real_final_X/real_final_y must be provided."
+                    "When sim_hat=False, real_val_X/real_val_y/real_threshold_X/"
+                    "real_threshold_y/real_final_X/real_final_y must be provided."
                 )
 
         self.B: float = set_B_from_quantile(self.spec, alpha=self.rmax_alpha)
@@ -504,7 +511,7 @@ class LDPAuditor:
         y_input: int,
         n: int,
         rng: np.random.Generator,
-        sample_source: Literal["val", "final"] = "final",
+        sample_source: Literal["val", "threshold", "final"] = "final",
     ) -> FeatureMatrix:
         if self.sim_hat:
             if self.spec is None:
@@ -518,8 +525,15 @@ class LDPAuditor:
             )
             return self.project_l2_ball(X, B=self.B)
 
-        X_pool: FeatureMatrix | None = self.real_val_X if sample_source == "val" else self.real_final_X
-        y_pool: np.ndarray | None = self.real_val_y if sample_source == "val" else self.real_final_y
+        if sample_source == "val":
+            X_pool: FeatureMatrix | None = self.real_val_X
+            y_pool: np.ndarray | None = self.real_val_y
+        elif sample_source == "threshold":
+            X_pool: FeatureMatrix | None = self.real_threshold_X
+            y_pool: np.ndarray | None = self.real_threshold_y
+        else:
+            X_pool: FeatureMatrix | None = self.real_final_X
+            y_pool: np.ndarray | None = self.real_final_y
         assert X_pool is not None and y_pool is not None
 
         idx_all: np.ndarray = np.flatnonzero(y_pool == y_input)
@@ -536,7 +550,7 @@ class LDPAuditor:
         n: int,
         rng: np.random.Generator,
         eta_model,
-        sample_source: Literal["val", "final"] = "final",
+        sample_source: Literal["val", "threshold", "final"] = "final",
     ) -> np.ndarray:
         """
         完全LRT用：eta(x) を学習モデルで推定する版
@@ -572,7 +586,7 @@ class LDPAuditor:
         n: int,
         rng: np.random.Generator,
         eta_model,
-        sample_source: Literal["val", "final"] = "final",
+        sample_source: Literal["val", "threshold", "final"] = "final",
     ) -> np.ndarray:
         """
         X-only（Decomposition）用：
@@ -598,7 +612,7 @@ class LDPAuditor:
         attack: Literal["complete_LRT_hat", "tilde y=y_alt only LRT_hat", "indirect_LRT_hat"],
         y_alt: int = 1,
         y_null: int = 0,
-        sample_source: Literal["val", "final"] = "final",
+        sample_source: Literal["val", "threshold", "final"] = "final",
         n_alt_eval: int | None = None,
         n_null_eval: int | None = None,
     ) -> dict:
@@ -616,7 +630,12 @@ class LDPAuditor:
                 n_alt: int = int(n_alt_eval)
                 n_null: int = int(n_null_eval)
             elif not self.sim_hat:
-                y_pool: np.ndarray | None = self.real_val_y if sample_source == "val" else self.real_final_y
+                if sample_source == "val":
+                    y_pool: np.ndarray | None = self.real_val_y
+                elif sample_source == "threshold":
+                    y_pool: np.ndarray | None = self.real_threshold_y
+                else:
+                    y_pool: np.ndarray | None = self.real_final_y
                 assert y_pool is not None
                 n_alt = int(np.sum(y_pool == y_alt))
                 n_null = int(np.sum(y_pool == y_null))
@@ -828,19 +847,22 @@ class LDPAuditor:
         # simulation用（実データなら None でOK）
         sim_n_train: int | None = 4000,
         sim_n_val: int | None = 2000,
+        sim_n_threshold: int | None = 2000,
         # 実データ用（simulationなら None でOK）
         X_train: FeatureMatrix | None = None,
         y_train: np.ndarray | None = None,
         X_val: FeatureMatrix | None = None,
         y_val: np.ndarray | None = None,
+        X_threshold: FeatureMatrix | None = None,
+        y_threshold: np.ndarray | None = None,
         prefit_model_best_by_attack: dict[str, dict[str, dict[str, Any]]] | None = None,
         y_alt: int = 1,
         y_null: int = 0,
     ) -> dict:
         """
         4モデルそれぞれで best hyperparam を選び、test評価（= evaluate）を返す。
-        - simulation: sim_n_train/sim_n_val を指定し、specからデータ生成
-        - real: X_train,y_train,X_val,y_val を渡す
+        - simulation: sim_n_train/sim_n_val/sim_n_threshold を指定し、specからデータ生成
+        - real: train/model_val/threshold split を渡す
         """
         if self.spec is None:
             raise ValueError("spec must be set.")
@@ -848,12 +870,13 @@ class LDPAuditor:
         rng: Generator = np.random.default_rng(seed)
         rng_train: Generator = np.random.default_rng(rng.integers(1 << 32))
         rng_val: Generator = np.random.default_rng(rng.integers(1 << 32))
+        rng_threshold: Generator = np.random.default_rng(rng.integers(1 << 32))
         rng_test: Generator = np.random.default_rng(rng.integers(1 << 32))
 
         # --- train/val データを用意 （simulation data 用） ---
         if X_train is None:
-            if sim_n_train is None or sim_n_val is None:
-                raise ValueError("For simulation mode, set sim_n_train and sim_n_val.")
+            if sim_n_train is None or sim_n_val is None or sim_n_threshold is None:
+                raise ValueError("For simulation mode, set sim_n_train, sim_n_val, and sim_n_threshold.")
             # y も含めてサンプリング
             X_train, y_train = sample_attack_trainset_from_spec(
                 n=sim_n_train,
@@ -869,9 +892,22 @@ class LDPAuditor:
                 B=self.B,
                 project_fn=self.project_l2_ball,
             )
+            X_threshold, y_threshold = sample_attack_trainset_from_spec(
+                n=sim_n_threshold,
+                spec=self.spec,
+                rng=rng_threshold,
+                B=self.B,
+                project_fn=self.project_l2_ball,
+            )
         else:
             # real mode
-            assert y_train is not None and X_val is not None and y_val is not None
+            assert (
+                y_train is not None
+                and X_val is not None
+                and y_val is not None
+                and X_threshold is not None
+                and y_threshold is not None
+            )
 
         cfgs: list[EtaModelConfig] = (
             list(eta_model_cfgs) if eta_model_cfgs is not None else get_default_eta_model_configs()
@@ -951,7 +987,7 @@ class LDPAuditor:
                 }
 
                 if attack_name == "indirect_LRT_hat":
-                    X_null = self._take_feature_rows(X_val, y_val == y_null)
+                    X_null = self._take_feature_rows(X_threshold, y_threshold == y_null)
                     scores_null: np.ndarray = self._eta_to_x_lr_prob(
                         predict_eta(model, X_null)
                     )
@@ -959,13 +995,13 @@ class LDPAuditor:
                     rng_tau: Generator = np.random.default_rng(int(rng.integers(1 << 31)))
                     scores_null = self._sample_p_theta_hat(
                         y_input=y_null,
-                        n=int(np.sum(y_val == y_null)),
+                        n=int(np.sum(y_threshold == y_null)),
                         rng=rng_tau,
                         eta_model=model,
-                        sample_source="val",
+                        sample_source="threshold",
                     )
                 else:
-                    scores_null = predict_eta(model, self._take_feature_rows(X_val, y_val == y_null))
+                    scores_null = predict_eta(model, self._take_feature_rows(X_threshold, y_threshold == y_null))
 
                 tau, q = dp_sniper_threshold_from_scores(scores_null, c=self.c)
                 tau = float(np.clip(tau, 1e-15, 1.0 - 1e-15))
