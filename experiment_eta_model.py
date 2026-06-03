@@ -1376,10 +1376,12 @@ def run_eta_model_experiments(
         )
     else:
         data_name: str = cfg.real_data_name or "real"
+        if X_val is None or X_threshold is None:
+            raise ValueError("Real-data mode requires X_val and X_threshold when saving results.")
         out_csv = (
             f"{output_root}/eta_hat_{data_name}_c={cfg.c}"
-            f"_f={cfg.nb_trials}_t={X_train.shape[0]}_v={X_val.shape[0]}" if X_val is not None else ""
-            f"_th={X_threshold.shape[0]}_d={X_train.shape[1]}.csv" # type: ignore
+            f"_f={cfg.nb_trials}_t={X_train.shape[0]}_v={X_val.shape[0]}"
+            f"_th={X_threshold.shape[0]}_d={X_train.shape[1]}.csv"
         )
     logging.info("Saving eta-model results to %s", out_csv)
     Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
@@ -1723,3 +1725,4 @@ if __name__ == "__main__":
 #   --seed_start 0 \
 #   --seed_end 9 \
 #   --score_dist
+
