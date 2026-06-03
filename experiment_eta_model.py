@@ -637,6 +637,88 @@ def _coerce_real_csv_frame(
     return pd.DataFrame(columns), y
 
 
+def _is_criteo_search_dataset(real_data_name: str | None) -> bool:
+    return real_data_name is not None and str(real_data_name).strip().lower() == "criteosearch"
+
+
+def _normalize_categorical_missing(series: pd.Series) -> pd.Series:
+    s: pd.Series = series.astype(str).str.strip()
+    return s.mask(s.isin(["", "-1", "nan", "None"]), "__MISSING__")
+
+
+def _add_log_numeric_feature(
+    frame: pd.DataFrame,
+    *,
+    source_col: str,
+    missing_if_nonpositive: bool = False,
+) -> None:
+    values: pd.Series = pd.to_numeric(frame[source_col], errors="coerce")
+    missing: pd.Series = values.isna() | (values < 0)
+    if missing_if_nonpositive:
+        missing = missing | (values <= 0)
+    clean: pd.Series = values.mask(missing, 0.0).clip(lower=0.0)
+    frame[f"{source_col}_missing"] = missing.astype(np.int8)
+    frame[f"{source_col}_log1p"] = np.log1p(clean).astype(np.float32)
+
+
+def _preprocess_criteo_search_features(X: pd.DataFrame) -> pd.DataFrame:
+    """
+    Feature engineering for Criteo Sponsored Search conversion data.
+
+    The raw dataset is not the Kaggle CTR table: it has a Unix click timestamp,
+    sparse price/click-count fields, many hashed categorical ids, and a
+    product_title field that is already a whitespace-separated token list.
+    """
+    required_cols: set[str] = {
+        "click_timestamp",
+        "nb_clicks_1week",
+        "product_price",
+        "product_title",
+    }
+    missing_cols: set[str] = required_cols.difference(str(col) for col in X.columns)
+    if missing_cols:
+        raise ValueError(f"CriteoSearch preprocessing missing columns: {sorted(missing_cols)}")
+
+    out: pd.DataFrame = X.copy(deep=False)
+
+    timestamp: pd.Series = pd.to_numeric(out["click_timestamp"], errors="coerce")
+    valid_timestamp: pd.Series = timestamp.notna() & (timestamp > 0)
+    dt: pd.Series = pd.to_datetime(timestamp.where(valid_timestamp), unit="s", utc=True, errors="coerce")
+    day_index: pd.Series = np.floor((timestamp - float(timestamp[valid_timestamp].min())) / 86400.0)    # type: ignore
+    day_index = day_index.where(valid_timestamp, -1)
+
+    out["click_hour"] = dt.dt.hour.fillna(-1).astype(np.int16).astype("category")
+    out["click_dayofweek"] = dt.dt.dayofweek.fillna(-1).astype(np.int16).astype("category")
+    out["click_day_index"] = day_index.fillna(-1).astype(np.int16).astype("category")
+    out["click_is_weekend"] = dt.dt.dayofweek.isin([5, 6]).fillna(False).astype(np.int8)
+
+    _add_log_numeric_feature(out, source_col="nb_clicks_1week")
+    _add_log_numeric_feature(out, source_col="product_price", missing_if_nonpositive=True)
+
+    categorical_cols: list[str] = out.select_dtypes(exclude=np.number).columns.tolist()
+    for col in categorical_cols:
+        normalized: pd.Series = _normalize_categorical_missing(out[col])
+        if col == "product_title":
+            normalized = normalized.str.replace(r"\s+", " ", regex=True)
+            out[col] = normalized.astype(str)
+        else:
+            out[col] = normalized.astype("category")
+
+    return out.drop(columns=["click_timestamp", "nb_clicks_1week", "product_price"])
+
+
+def _preprocess_real_features(
+    X: FeatureMatrix,
+    *,
+    real_data_name: str | None,
+) -> FeatureMatrix:
+    if _is_criteo_search_dataset(real_data_name):
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("CriteoSearch preprocessing expects a pandas DataFrame.")
+        return _preprocess_criteo_search_features(X)
+    return X
+
+
 def _load_mixed_real_csv_all_rows(
     *,
     csv_path: str,
@@ -726,7 +808,7 @@ def load_susy_real_data_split(
         else:
             sampled = _reservoir_sample_csv_rows(csv_path=csv_path, n_rows=n_total, seed=seed)
         y: np.ndarray = sampled[:, 0].astype(np.int64)
-        X: np.ndarray = sampled[:, 1:].astype(np.float32)
+        X: FeatureMatrix = sampled[:, 1:].astype(np.float32)
     else:
         if n_total == total_rows:
             X, y = _load_mixed_real_csv_all_rows(
@@ -747,6 +829,8 @@ def load_susy_real_data_split(
                 feature_kinds=feature_kinds,
                 feature_names=feature_names,
             ) # type: ignore
+
+    X = _preprocess_real_features(X, real_data_name=real_data_name)
 
     X_train, X_rest, y_train, y_rest = train_test_split(
         X,

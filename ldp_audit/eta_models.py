@@ -225,6 +225,16 @@ class LibFFMClassifier:
             self._feature_to_id[key] = self._next_feature_id()
         return self._feature_to_id[key]
 
+    def _categorical_tokens(self, value: Any) -> list[str]:
+        text: str = str(value).strip()
+        if text == "":
+            return []
+        # CriteoSearch product_title is stored as a whitespace-separated hashed
+        # token list.  Expanding any whitespace-separated categorical value keeps
+        # that field multi-hot for libFFM instead of treating the whole title as
+        # one rare category.
+        return [token for token in text.split() if token]
+
     def _iter_rows(self, X: np.ndarray | pd.DataFrame) -> Iterator[list[Any]]:
         feature_names: list[str] = self._feature_names if self._feature_names is not None else self._get_feature_names(X)
         if isinstance(X, pd.DataFrame):
@@ -278,9 +288,10 @@ class LibFFMClassifier:
                         feature_id: int | None = self._numeric_feature_id(field_name)
                         parts.append(f"{field_id}:{feature_id}:{self._format_value(value)}")
                     else:
-                        feature_id = self._categorical_feature_id(field_name, raw_value, fit=fit)
-                        if feature_id is not None:
-                            parts.append(f"{field_id}:{feature_id}:1")
+                        for token in self._categorical_tokens(raw_value):
+                            feature_id = self._categorical_feature_id(field_name, token, fit=fit)
+                            if feature_id is not None:
+                                parts.append(f"{field_id}:{feature_id}:1")
                 f.write(" ".join(parts))
                 f.write("\n")
 
@@ -338,13 +349,13 @@ def _build_real_data_preprocessor(
     *,
     needs_scaling: bool,
 ) -> ColumnTransformer:
-    del needs_scaling
     numeric_cols: list[str] = X_sample.select_dtypes(include=np.number).columns.tolist()
     categorical_cols: list[str] = X_sample.select_dtypes(exclude=np.number).columns.tolist()
     transformers: list[tuple[str, Any, Any]] = []
 
     if len(numeric_cols) > 0:
-        transformers.append(("num", "passthrough", numeric_cols))
+        numeric_transformer: Any = StandardScaler() if needs_scaling else "passthrough"
+        transformers.append(("num", numeric_transformer, numeric_cols))
 
     text_title_col: str | None = None
     if "product_title" in X_sample.columns and "product_title" in categorical_cols:
