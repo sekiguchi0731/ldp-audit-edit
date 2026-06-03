@@ -1696,3 +1696,30 @@ if __name__ == "__main__":
 #   --N_ratio 0.2,0.2,0.6 \
 #   --seed_start 0 \
 #   --seed_end 1
+
+# python experiment_eta_model.py \
+#   --real_data \
+#   --real_data_path ./data/criteo_search/criteo_search_numeric.csv \
+#   --real_data_name CriteoSearch \
+#   --output_root ./results/20260401/criteo_smoke \
+#   --evaluate_both_reports \
+#   --eta_models ffm \
+#   --use_reduced_grid \
+#   --N_total 10000 \
+#   --N_ratio 0.2,0.2,0.6 \
+#   --seed_start 0 \
+#   --seed_end 1
+
+# python experiment_eta_model.py \
+#   --real_data \
+#   --real_data_path ./data/avazu/avazu_train_label_first.csv \
+#   --real_data_name Avazu \
+#   --output_root ./results/20260401/avazu_smoke \
+#   --evaluate_both_reports \
+#   --eta_models ffm \
+#   --use_reduced_grid \
+#   --N_total 40428967 \
+#   --N_ratio 0.2,0.2,0.6 \
+#   --seed_start 0 \
+#   --seed_end 9 \
+#   --score_dist
