@@ -76,6 +76,7 @@ class EtaExperimentConfig:
     ratio_threshold: float | None = None
     ratio_final: float | None = None
     real_data_name: str | None = None
+    criteo_search_drop_product_price: bool = False
     collect_score_distribution: bool = False
 
     # output
@@ -672,7 +673,6 @@ def _preprocess_criteo_search_features(X: pd.DataFrame) -> pd.DataFrame:
     required_cols: set[str] = {
         "click_timestamp",
         "nb_clicks_1week",
-        "product_price",
         "product_title",
     }
     missing_cols: set[str] = required_cols.difference(str(col) for col in X.columns)
@@ -693,7 +693,8 @@ def _preprocess_criteo_search_features(X: pd.DataFrame) -> pd.DataFrame:
     out["click_is_weekend"] = dt.dt.dayofweek.isin([5, 6]).fillna(False).astype(np.int8)
 
     _add_log_numeric_feature(out, source_col="nb_clicks_1week")
-    _add_log_numeric_feature(out, source_col="product_price", missing_if_nonpositive=True)
+    if "product_price" in out.columns:
+        _add_log_numeric_feature(out, source_col="product_price", missing_if_nonpositive=True)
 
     categorical_cols: list[str] = out.select_dtypes(exclude=np.number).columns.tolist()
     for col in categorical_cols:
@@ -704,17 +705,20 @@ def _preprocess_criteo_search_features(X: pd.DataFrame) -> pd.DataFrame:
         else:
             out[col] = normalized.astype("category")
 
-    return out.drop(columns=["click_timestamp", "nb_clicks_1week", "product_price"])
+    return out.drop(columns=["click_timestamp", "nb_clicks_1week", "product_price"], errors="ignore")
 
 
 def _preprocess_real_features(
     X: FeatureMatrix,
     *,
     real_data_name: str | None,
+    criteo_search_drop_product_price: bool = False,
 ) -> FeatureMatrix:
     if _is_criteo_search_dataset(real_data_name):
         if not isinstance(X, pd.DataFrame):
             raise TypeError("CriteoSearch preprocessing expects a pandas DataFrame.")
+        if criteo_search_drop_product_price:
+            X = X.drop(columns=["product_price"])
         return _preprocess_criteo_search_features(X)
     return X
 
@@ -770,6 +774,7 @@ def load_susy_real_data_split(
     n_final: int,
     seed: int,
     real_data_name: str | None = None,
+    criteo_search_drop_product_price: bool = False,
 ) -> tuple[
     FeatureMatrix,
     np.ndarray,
@@ -830,7 +835,11 @@ def load_susy_real_data_split(
                 feature_names=feature_names,
             ) # type: ignore
 
-    X = _preprocess_real_features(X, real_data_name=real_data_name)
+    X = _preprocess_real_features(
+        X,
+        real_data_name=real_data_name,
+        criteo_search_drop_product_price=criteo_search_drop_product_price,
+    )
 
     X_train, X_rest, y_train, y_rest = train_test_split(
         X,
@@ -1471,6 +1480,14 @@ if __name__ == "__main__":
         default="./data/SUSY/SUSY.csv",
     )
     parser.add_argument("--real_data_name", type=str, default="SUSY")
+    parser.add_argument(
+        "--criteo_search_drop_product_price",
+        action="store_true",
+        help=(
+            "If set with --real_data_name CriteoSearch, drop product_price before "
+            "CriteoSearch-specific feature engineering."
+        ),
+    )
     parser.add_argument("--real_data_seed", type=int, default=0)
     parser.add_argument(
         "--score_dist",
@@ -1558,6 +1575,7 @@ if __name__ == "__main__":
             else 2000
         ),
         real_data_name=args.real_data_name if args.real_data else None,
+        criteo_search_drop_product_price=bool(args.criteo_search_drop_product_price),
         collect_score_distribution=collect_score_distribution,
         analysis=args.analysis,
         output_root=args.output_root,
@@ -1592,6 +1610,7 @@ if __name__ == "__main__":
                 n_final=int(cfg.nb_trials),
                 seed=int(args.real_data_seed),
                 real_data_name=args.real_data_name,
+                criteo_search_drop_product_price=bool(args.criteo_search_drop_product_price),
             )
             df: pd.DataFrame = run_eta_model_experiments(
                 cfg=cfg,
@@ -1726,3 +1745,18 @@ if __name__ == "__main__":
 #   --seed_end 9 \
 #   --score_dist
 
+# python experiment_eta_model.py \
+#   --real_data \
+#   --real_data_path ./data/criteo_search/criteo_search_numeric.csv \
+#   --real_data_name CriteoSearch \
+#   --criteo_search_drop_product_price \
+#   --output_root ./results/20260604/criteo_search_preprocessed_no_price_smoke \
+#   --evaluate_both_reports \
+#   --use_reduced_grid \
+#   --eta_models logreg ffm mlp \
+#   --selection eps_lower \
+#   --N_total 100000 \
+#   --N_ratio 0.2,0.2,0.2,0.4 \
+#   --seed_start 0 \
+#   --seed_end 1 \
+#   --score_dist
