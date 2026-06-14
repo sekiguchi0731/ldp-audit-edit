@@ -762,6 +762,216 @@ class LDPAuditor:
             "eps_emp": eps_emp,
             "eps_ci": (eps_lower, eps_upper),
         }
+
+    def _sample_attack_scores_hat(
+        self,
+        *,
+        y_input: int,
+        n: int,
+        rng: np.random.Generator,
+        eta_model,
+        attack: Literal["complete_LRT_hat", "tilde y=y_alt only LRT_hat", "indirect_LRT_hat"],
+        sample_source: Literal["val", "threshold", "final"] = "final",
+        y_alt: int = 1,
+    ) -> np.ndarray:
+        """Sample the scalar attack score used by threshold attacks."""
+        if attack == "complete_LRT_hat":
+            return self._sample_p_theta_hat(
+                y_input=y_input,
+                n=n,
+                rng=rng,
+                eta_model=eta_model,
+                sample_source=sample_source,
+            )
+
+        if attack == "indirect_LRT_hat":
+            return expit(
+                self._sample_score_x_hat(
+                    y_input=y_input,
+                    n=n,
+                    rng=rng,
+                    eta_model=eta_model,
+                    sample_source=sample_source,
+                )
+            )
+
+        if attack == "tilde y=y_alt only LRT_hat":
+            score: np.ndarray = self._sample_score_x_hat(
+                y_input=y_input,
+                n=n,
+                rng=rng,
+                eta_model=eta_model,
+                sample_source=sample_source,
+            )
+            ytilde: np.ndarray = grr_sample_binary(
+                y=y_input,
+                n=n,
+                epsilon=float(self.epsilon),
+                rng=rng,
+            )
+            out = np.zeros(n, dtype=np.float64)
+            mask: np.ndarray = ytilde == y_alt
+            out[mask] = expit(score[mask])
+            return out
+
+        raise ValueError(f"Unknown attack type: {attack}")
+
+    @staticmethod
+    def _counts_above_thresholds(scores: np.ndarray, thresholds: np.ndarray) -> np.ndarray:
+        """Return counts of scores satisfying scores > threshold for every threshold."""
+        scores_sorted: np.ndarray = np.sort(np.asarray(scores, dtype=np.float64))
+        thresholds_arr: np.ndarray = np.asarray(thresholds, dtype=np.float64)
+        idx: np.ndarray = np.searchsorted(scores_sorted, thresholds_arr + 1e-12, side="right")
+        return (scores_sorted.size - idx).astype(np.int64)
+
+    @staticmethod
+    def _beta_cp_interval(
+        counts: np.ndarray,
+        n: int,
+        *,
+        one_sided_alpha: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        cp_alpha: float = float(np.clip(2.0 * one_sided_alpha, 1e-300, 1.0 - 1e-12))
+        lo, hi = proportion_confint(counts, n, alpha=cp_alpha, method="beta")
+        return np.asarray(lo, dtype=np.float64), np.asarray(hi, dtype=np.float64)
+
+    def evaluate_eps_with_theory_grid_cp_hat(
+        self,
+        *,
+        tau_grid_scores: np.ndarray,
+        rng: np.random.Generator,
+        eta_model,
+        attack: Literal["complete_LRT_hat", "tilde y=y_alt only LRT_hat", "indirect_LRT_hat"],
+        y_alt: int = 1,
+        y_null: int = 0,
+        sample_source: Literal["val", "threshold", "final"] = "final",
+        n_alt_eval: int | None = None,
+        n_null_eval: int | None = None,
+    ) -> dict:
+        """
+        Evaluate a finite threshold grid with CP-LCB and choose the best threshold.
+
+        The grid must be built independently of the evaluation sample.  We use a
+        Bonferroni split across all grid thresholds and the one-sided CP events
+        used here: numerator lower/upper bounds, denominator upper bound, and
+        denominator lower bound for conservative c-feasibility.
+        """
+        if self.sim_hat and self.spec is None:
+            raise ValueError("spec must be set for evaluation.")
+
+        tau_grid_arr: np.ndarray = np.asarray(tau_grid_scores, dtype=np.float64)
+        grid: np.ndarray = np.unique(tau_grid_arr[np.isfinite(tau_grid_arr)])
+        grid = np.clip(grid, 1e-15, 1.0 - 1e-15)
+        grid = np.unique(grid)
+        if grid.size == 0:
+            raise ValueError("tau_grid_scores must contain at least one finite value.")
+
+        def _resolve_eval_counts() -> tuple[int, int]:
+            if n_alt_eval is not None and n_null_eval is not None:
+                n_alt: int = int(n_alt_eval)
+                n_null: int = int(n_null_eval)
+            elif not self.sim_hat:
+                if sample_source == "val":
+                    y_pool: np.ndarray | None = self.real_val_y
+                elif sample_source == "threshold":
+                    y_pool = self.real_threshold_y
+                else:
+                    y_pool = self.real_final_y
+                assert y_pool is not None
+                n_alt = int(np.sum(y_pool == y_alt))
+                n_null = int(np.sum(y_pool == y_null))
+            else:
+                n_alt = int(self.nb_trials)
+                n_null = int(self.nb_trials)
+
+            if min(n_alt, n_null) <= 0:
+                raise ValueError(
+                    f"Evaluation counts must be positive. Got n_alt={n_alt}, n_null={n_null}, "
+                    f"sample_source={sample_source}."
+                )
+            return n_alt, n_null
+
+        n_alt, n_null = _resolve_eval_counts()
+        p_alt: np.ndarray = self._sample_attack_scores_hat(
+            y_input=y_alt,
+            n=n_alt,
+            rng=rng,
+            eta_model=eta_model,
+            attack=attack,
+            sample_source=sample_source,
+            y_alt=y_alt,
+        )
+        p_null: np.ndarray = self._sample_attack_scores_hat(
+            y_input=y_null,
+            n=n_null,
+            rng=rng,
+            eta_model=eta_model,
+            attack=attack,
+            sample_source=sample_source,
+            y_alt=y_alt,
+        )
+
+        tp_by_t: np.ndarray = self._counts_above_thresholds(p_alt, grid)
+        fp_by_t: np.ndarray = self._counts_above_thresholds(p_null, grid)
+        tpr_hat_by_t: np.ndarray = tp_by_t / float(n_alt)
+        fpr_hat_by_t: np.ndarray = fp_by_t / float(n_null)
+
+        one_sided_alpha: float = float(self.alpha) / max(4 * int(grid.size), 1)
+        tpr_lo_by_t, tpr_hi_by_t = self._beta_cp_interval(
+            tp_by_t,
+            n_alt,
+            one_sided_alpha=one_sided_alpha,
+        )
+        fpr_lo_by_t, fpr_hi_by_t = self._beta_cp_interval(
+            fp_by_t,
+            n_null,
+            one_sided_alpha=one_sided_alpha,
+        )
+
+        eps_floor: float = 1e-300
+        eps_emp_by_t: np.ndarray = np.log(
+            np.maximum(tpr_hat_by_t, eps_floor) / np.maximum(fpr_hat_by_t, eps_floor)
+        )
+        eps_lower_by_t: np.ndarray = np.log(
+            np.maximum(tpr_lo_by_t, eps_floor) / np.maximum(fpr_hi_by_t, eps_floor)
+        )
+        eps_upper_by_t: np.ndarray = np.log(
+            np.maximum(tpr_hi_by_t, eps_floor) / np.maximum(fpr_lo_by_t, eps_floor)
+        )
+
+        c_floor: float = max(float(self.c), 1e-12)
+        feasible: np.ndarray = fpr_lo_by_t >= c_floor
+        if np.any(feasible):
+            candidate_indices: np.ndarray = np.flatnonzero(feasible)
+        else:
+            # Strict c-feasibility can be empty for small final samples.  Keep the
+            # run inspectable without pretending the c-clipped theorem applies.
+            candidate_indices = np.arange(grid.size)
+            eps_lower_by_t = np.full_like(eps_lower_by_t, -np.inf, dtype=np.float64)
+
+        best_relative_idx: int = int(np.argmax(eps_lower_by_t[candidate_indices]))
+        best_idx: int = int(candidate_indices[best_relative_idx])
+
+        return {
+            "TP": int(tp_by_t[best_idx]),
+            "FP": int(fp_by_t[best_idx]),
+            "N_final": int(self.nb_trials),
+            "N_alt_eval": int(n_alt),
+            "N_null_eval": int(n_null),
+            "tpr_hat": float(tpr_hat_by_t[best_idx]),
+            "fpr_hat": float(fpr_hat_by_t[best_idx]),
+            "tpr_ci": (float(tpr_lo_by_t[best_idx]), float(tpr_hi_by_t[best_idx])),
+            "fpr_ci": (float(fpr_lo_by_t[best_idx]), float(fpr_hi_by_t[best_idx])),
+            "eps_emp": float(eps_emp_by_t[best_idx]),
+            "eps_ci": (float(eps_lower_by_t[best_idx]), float(eps_upper_by_t[best_idx])),
+            "tau": float(grid[best_idx]),
+            "q": 0.0,
+            "tau_selection": "theory",
+            "tau_grid_size": int(grid.size),
+            "tau_grid_feasible_size": int(np.sum(feasible)),
+            "tau_cp_one_sided_alpha": float(one_sided_alpha),
+            "tau_selected_index": int(best_idx),
+        }
     
     def _select_score_fn_for_eta_model(
         self,
@@ -840,6 +1050,7 @@ class LDPAuditor:
         # 共通
         seed: int = 0,
         selection: Literal["eps_lower", "eps_emp", "tpr_at_fpr"] = "eps_lower",
+        tau_selection: Literal["cN", "theory"] = "cN",
         report_attacks: Sequence[
             Literal["complete_LRT_hat", "tilde y=y_alt only LRT_hat", "indirect_LRT_hat"]
         ] | None = None,
@@ -866,6 +1077,8 @@ class LDPAuditor:
         """
         if self.spec is None:
             raise ValueError("spec must be set.")
+        if tau_selection not in ("cN", "theory"):
+            raise ValueError("tau_selection must be either 'cN' or 'theory'.")
 
         rng: Generator = np.random.default_rng(seed)
         rng_train: Generator = np.random.default_rng(rng.integers(1 << 32))
@@ -976,7 +1189,7 @@ class LDPAuditor:
         for cfg in cfgs:
             name: str = cfg.name
             tests_by_attack: dict[str, dict[str, Any]] = {}
-            tau_q_by_attack: dict[str, dict[str, float]] = {}
+            tau_q_by_attack: dict[str, dict[str, Any]] = {}
             best_by_attack: dict[str, dict[str, Any]] = {}
             for attack_name in report_attack_list:
                 best: dict[str, Any] = per_attack_model_best[str(attack_name)][name]
@@ -993,36 +1206,66 @@ class LDPAuditor:
                     )
                 elif attack_name == "complete_LRT_hat":
                     rng_tau: Generator = np.random.default_rng(int(rng.integers(1 << 31)))
-                    scores_null = self._sample_p_theta_hat(
-                        y_input=y_null,
+                    X_null = self._take_feature_rows(X_threshold, y_threshold == y_null)
+                    eta_hat_null: np.ndarray = predict_eta(model, X_null)
+                    ytilde_null: np.ndarray = grr_sample_binary(
+                        y=y_null,
                         n=int(np.sum(y_threshold == y_null)),
+                        epsilon=float(self.epsilon),
                         rng=rng_tau,
-                        eta_model=model,
-                        sample_source="threshold",
+                    )
+                    scores_null = expit(
+                        attack_lrt_scores(ytilde_null, eta_hat_null, float(self.epsilon))
+                        + self._log_eta_prior_correction()
                     )
                 else:
                     scores_null = predict_eta(model, self._take_feature_rows(X_threshold, y_threshold == y_null))
 
-                tau, q = dp_sniper_threshold_from_scores(scores_null, c=self.c)
-                tau = float(np.clip(tau, 1e-15, 1.0 - 1e-15))
-                q = float(np.clip(q, 0.0, 1.0))
-                tau_q_by_attack[str(attack_name)] = {"tau": tau, "q": q}
-
                 rng_for_attack: Generator = np.random.default_rng(rng_test.integers(1 << 32))
-                res_test: dict = self.evaluate_eps_with_dp_sniper_cp_hat(
-                    tau=tau,
-                    q=q,
-                    rng=rng_for_attack,
-                    eta_model=model,
-                    attack=attack_name,
-                    y_alt=y_alt,
-                    y_null=y_null,
-                    sample_source="final",
-                )
+                if tau_selection == "cN":
+                    tau, q = dp_sniper_threshold_from_scores(scores_null, c=self.c)
+                    tau = float(np.clip(tau, 1e-15, 1.0 - 1e-15))
+                    q = float(np.clip(q, 0.0, 1.0))
+                    tau_q_by_attack[str(attack_name)] = {
+                        "tau": tau,
+                        "q": q,
+                        "tau_selection": tau_selection,
+                    }
+
+                    res_test: dict = self.evaluate_eps_with_dp_sniper_cp_hat(
+                        tau=tau,
+                        q=q,
+                        rng=rng_for_attack,
+                        eta_model=model,
+                        attack=attack_name,
+                        y_alt=y_alt,
+                        y_null=y_null,
+                        sample_source="final",
+                    )
+                else:
+                    res_test = self.evaluate_eps_with_theory_grid_cp_hat(
+                        tau_grid_scores=scores_null,
+                        rng=rng_for_attack,
+                        eta_model=model,
+                        attack=attack_name,
+                        y_alt=y_alt,
+                        y_null=y_null,
+                        sample_source="final",
+                    )
+                    tau_q_by_attack[str(attack_name)] = {
+                        "tau": float(res_test["tau"]),
+                        "q": float(res_test["q"]),
+                        "tau_selection": tau_selection,
+                        "tau_grid_size": int(res_test["tau_grid_size"]),
+                        "tau_grid_feasible_size": int(res_test["tau_grid_feasible_size"]),
+                        "tau_cp_one_sided_alpha": float(res_test["tau_cp_one_sided_alpha"]),
+                        "tau_selected_index": int(res_test["tau_selected_index"]),
+                    }
                 tests_by_attack[str(attack_name)] = res_test
 
             report[name] = {
                 "selected_by": selection,
+                "tau_selection": tau_selection,
                 "best_val_score": float(best_by_attack[str(primary_report_attack)]["best_val_score"]),
                 "params": best_by_attack[str(primary_report_attack)]["params"],
                 "best_by_attack": best_by_attack,
@@ -1038,6 +1281,7 @@ class LDPAuditor:
         prior_0, prior_1 = self.eta_class_prior if self.eta_class_prior is not None else (0.5, 0.5)
         return {
             "selection": selection,
+            "tau_selection": tau_selection,
             "report_attacks": [str(a) for a in report_attack_list],
             "model_best_by_attack": per_attack_model_best,
             "eta_class_prior": {

@@ -55,6 +55,7 @@ class EtaExperimentConfig:
     selection: Literal["eps_lower", "eps_emp", "tpr_at_fpr"] = "eps_lower"
     # If True, evaluate both complete/indirect attacks with attack-specific tau,q.
     evaluate_both_reports: bool = True
+    tau_selection: Literal["cN", "theory"] = "cN"
     use_reduced_grid: bool = True
     hyperparameter: Literal["grid", "fixed"] = "grid"
     eta_models: tuple[str, ...] = ("logreg", "svm_rbf", "rf", "mlp")
@@ -877,6 +878,7 @@ def _append_metric(
     nb_trials: int,
     alpha: float,
     selection: str,
+    tau_selection: str,
     attack_for_selection: str,
     attack_for_report: str,
     sim_d: int | None,
@@ -905,6 +907,7 @@ def _append_metric(
     rows["alpha"].append(alpha)
 
     rows["selection"].append(selection)
+    rows["tau_selection"].append(tau_selection)
     rows["attack_for_selection"].append(attack_for_selection)
     rows["attack_for_report"].append(attack_for_report)
 
@@ -965,9 +968,10 @@ def run_eta_model_experiments(
     eta_model_cfgs: list[EtaModelConfig] = _resolve_eta_model_configs(cfg)
 
     logging.info(
-        "analysis=%s selection=%s report_attacks=%s eps=%s reduced_grid=%s hyperparameter=%s eta_models=%s",
+        "analysis=%s selection=%s tau_selection=%s report_attacks=%s eps=%s reduced_grid=%s hyperparameter=%s eta_models=%s",
         cfg.analysis,
         cfg.selection,
+        cfg.tau_selection,
         report_attacks,
         eps_list,
         cfg.use_reduced_grid,
@@ -986,6 +990,7 @@ def run_eta_model_experiments(
         "nb_trials": [],
         "alpha": [],
         "selection": [],
+        "tau_selection": [],
         "attack_for_selection": [],
         "attack_for_report": [],
         "sim_d": [],
@@ -1063,6 +1068,7 @@ def run_eta_model_experiments(
     output_root: Path = Path(cfg.output_root)
     dist_output_dir: Path = output_root / "score_distributions"
     score_dist_data_name: str = cfg.real_data_name or "real"
+    tau_selection_suffix: str = "" if cfg.tau_selection == "cN" else f"_tau={cfg.tau_selection}"
 
     def append_row(
         *,
@@ -1086,6 +1092,7 @@ def run_eta_model_experiments(
             nb_trials=int(cfg.nb_trials),
             alpha=float(cfg.alpha),
             selection=str(cfg.selection),
+            tau_selection=str(cfg.tau_selection),
             attack_for_selection=attack_for_selection,
             attack_for_report=attack_for_report,
             sim_d=sim_d_row,
@@ -1170,6 +1177,7 @@ def run_eta_model_experiments(
             out: dict = auditor.run_eta_model_comparison_4way(
                 seed=int(seed),
                 selection=cfg.selection,
+                tau_selection=cfg.tau_selection,
                 report_attacks=report_attacks,
                 eta_model_cfgs=eta_model_cfgs,
                 sim_n_train=cfg.sim_n_train if X_train is None else None,
@@ -1273,6 +1281,24 @@ def run_eta_model_experiments(
                             params_json=params_json_by_attack.get(str(attack_name)),
                             attack_for_report=str(attack_name),
                         )
+                        for metric_key in (
+                            "tau_grid_size",
+                            "tau_grid_feasible_size",
+                            "tau_cp_one_sided_alpha",
+                            "tau_selected_index",
+                        ):
+                            if metric_key not in tau_q:
+                                continue
+                            append_row(
+                                seed=int(seed),
+                                protocol=protocol,
+                                epsilon=epsilon,
+                                attack_for_selection=str(attack_name),
+                                metric=metric_key,
+                                value=float(tau_q[metric_key]),
+                                params_json=params_json_by_attack.get(str(attack_name)),
+                                attack_for_report=str(attack_name),
+                            )
                 else:
                     append_row(
                         seed=int(seed),
@@ -1329,6 +1355,37 @@ def run_eta_model_experiments(
                         params_json=params_json_by_attack.get(str(attack_name)),
                         attack_for_report=str(attack_name),
                     )
+                    if "indirect" in str(attack_name).lower():
+                        append_row(
+                            seed=int(seed),
+                            protocol=protocol,
+                            epsilon=epsilon,
+                            attack_for_selection=str(attack_name),
+                            metric="test_eps_emp_plus_rr",
+                            value=float(test["eps_emp"]) + float(epsilon),
+                            params_json=params_json_by_attack.get(str(attack_name)),
+                            attack_for_report=str(attack_name),
+                        )
+                        append_row(
+                            seed=int(seed),
+                            protocol=protocol,
+                            epsilon=epsilon,
+                            attack_for_selection=str(attack_name),
+                            metric="test_eps_lower_plus_rr",
+                            value=float(eps_lo) + float(epsilon),
+                            params_json=params_json_by_attack.get(str(attack_name)),
+                            attack_for_report=str(attack_name),
+                        )
+                        append_row(
+                            seed=int(seed),
+                            protocol=protocol,
+                            epsilon=epsilon,
+                            attack_for_selection=str(attack_name),
+                            metric="test_eps_upper_plus_rr",
+                            value=float(eps_hi) + float(epsilon),
+                            params_json=params_json_by_attack.get(str(attack_name)),
+                            attack_for_report=str(attack_name),
+                        )
                     append_row(
                         seed=int(seed),
                         protocol=protocol,
@@ -1381,7 +1438,7 @@ def run_eta_model_experiments(
         out_csv: str = (
             f"{output_root}/eta_hat_shift={cfg.sim_mean_shift}_c={cfg.c}"
             f"_f={cfg.nb_trials}_t={cfg.sim_n_train}_v={cfg.sim_n_val}"
-            f"_th={cfg.sim_n_threshold}_d={cfg.sim_d}.csv"
+            f"_th={cfg.sim_n_threshold}_d={cfg.sim_d}{tau_selection_suffix}.csv"
         )
     else:
         data_name: str = cfg.real_data_name or "real"
@@ -1390,7 +1447,7 @@ def run_eta_model_experiments(
         out_csv = (
             f"{output_root}/eta_hat_{data_name}_c={cfg.c}"
             f"_f={cfg.nb_trials}_t={X_train.shape[0]}_v={X_val.shape[0]}"
-            f"_th={X_threshold.shape[0]}_d={X_train.shape[1]}.csv"
+            f"_th={X_threshold.shape[0]}_d={X_train.shape[1]}{tau_selection_suffix}.csv"
         )
     logging.info("Saving eta-model results to %s", out_csv)
     Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
@@ -1430,6 +1487,17 @@ if __name__ == "__main__":
         "--selection",
         choices=["eps_lower", "eps_emp", "tpr_at_fpr"],
         default="eps_lower",
+    )
+    parser.add_argument(
+        "--tau_selection",
+        choices=["cN", "theory"],
+        default="cN",
+        help=(
+            "Threshold selection strategy: cN keeps the current DP-Sniper "
+            "ceil(cN) null order statistic; theory builds a finite threshold "
+            "grid from threshold null scores and maximizes Bonferroni-adjusted "
+            "CP-LCB on the final split."
+        ),
     )
     parser.add_argument("--use_reduced_grid", action="store_true")
     parser.add_argument(
@@ -1554,6 +1622,7 @@ if __name__ == "__main__":
         y_alt=args.y_alt,
         y_null=args.y_null,
         selection=cast(Literal["eps_lower", "eps_emp", "tpr_at_fpr"], args.selection),
+        tau_selection=cast(Literal["cN", "theory"], args.tau_selection),
         evaluate_both_reports=bool(args.evaluate_both_reports),
         use_reduced_grid=bool(args.use_reduced_grid),
         hyperparameter=cast(Literal["grid", "fixed"], args.hyperparameter),
