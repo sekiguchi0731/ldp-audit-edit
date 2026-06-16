@@ -24,7 +24,9 @@ from ldp_audit.eta_models import (
     get_fixed_logreg_eta_model_configs,
     get_libffm_eta_model_configs,
     get_reduced_eta_model_configs,
+    get_torch_mlp_eta_model_configs,
     predict_eta,
+    resolve_torch_device,
 )
 from ldp_audit.simulation import MixtureSpec
 
@@ -59,6 +61,8 @@ class EtaExperimentConfig:
     use_reduced_grid: bool = True
     hyperparameter: Literal["grid", "fixed"] = "grid"
     eta_models: tuple[str, ...] = ("logreg", "svm_rbf", "rf", "mlp")
+    use_gpu: bool = False
+    torch_device: str = "auto"
     ffm_train_path: str = "ffm-train"
     ffm_predict_path: str = "ffm-predict"
     ffm_threads: int = 1
@@ -101,6 +105,20 @@ def _resolve_eta_model_configs(cfg: EtaExperimentConfig) -> list[EtaModelConfig]
     ):
         requested = ["logreg"]
 
+    needs_torch: bool = bool(cfg.use_gpu or "torch_mlp" in requested)
+    resolved_torch_device: str = resolve_torch_device(cfg.torch_device) if needs_torch else "cpu"
+    if cfg.use_gpu:
+        if resolved_torch_device != "cpu":
+            requested = ["torch_mlp" if name == "mlp" else name for name in requested]
+            logging.info(
+                "--use_gpu enabled: replacing sklearn mlp with torch_mlp on device=%s",
+                resolved_torch_device,
+            )
+        else:
+            logging.info(
+                "--use_gpu enabled, but no CUDA/MPS backend is available; keeping CPU sklearn mlp."
+            )
+
     if cfg.hyperparameter == "fixed":
         base_cfgs: list[EtaModelConfig] = get_fixed_logreg_eta_model_configs(c_value=0.1)
     else:
@@ -111,6 +129,16 @@ def _resolve_eta_model_configs(cfg: EtaExperimentConfig) -> list[EtaModelConfig]
         )
 
     by_name: dict[str, EtaModelConfig] = {model_cfg.name: model_cfg for model_cfg in base_cfgs}
+    if "torch_mlp" in requested:
+        by_name.update(
+            {
+                model_cfg.name: model_cfg
+                for model_cfg in get_torch_mlp_eta_model_configs(
+                    device=cfg.torch_device,
+                    reduced=cfg.use_reduced_grid,
+                )
+            }
+        )
     if "ffm" in requested:
         by_name.update(
             {
@@ -968,7 +996,7 @@ def run_eta_model_experiments(
     eta_model_cfgs: list[EtaModelConfig] = _resolve_eta_model_configs(cfg)
 
     logging.info(
-        "analysis=%s selection=%s tau_selection=%s report_attacks=%s eps=%s reduced_grid=%s hyperparameter=%s eta_models=%s",
+        "analysis=%s selection=%s tau_selection=%s report_attacks=%s eps=%s reduced_grid=%s hyperparameter=%s eta_models=%s use_gpu=%s torch_device=%s",
         cfg.analysis,
         cfg.selection,
         cfg.tau_selection,
@@ -977,6 +1005,8 @@ def run_eta_model_experiments(
         cfg.use_reduced_grid,
         cfg.hyperparameter,
         [model_cfg.name for model_cfg in eta_model_cfgs],
+        cfg.use_gpu,
+        cfg.torch_device,
     )
 
     # ---------- results container (long) ----------
@@ -1509,12 +1539,26 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eta_models",
         nargs="+",
-        choices=["logreg", "svm_rbf", "rf", "mlp", "ffm", "all"],
+        choices=["logreg", "svm_rbf", "rf", "mlp", "ffm", "torch_mlp", "all"],
         default=["logreg", "svm_rbf", "rf", "mlp"],
         help=(
-            "Eta model families to run. Add 'ffm' to use libffm, or use 'all' "
-            "for logreg/svm_rbf/rf/mlp/ffm."
+            "Eta model families to run. Add 'ffm' to use libffm, add "
+            "'torch_mlp' to use the optional PyTorch MLP, or use 'all'."
         ),
+    )
+    parser.add_argument(
+        "--use_gpu",
+        action="store_true",
+        help=(
+            "If a CUDA/MPS backend is available, replace requested sklearn mlp "
+            "with torch_mlp so the MLP can run on GPU. Other sklearn models stay CPU."
+        ),
+    )
+    parser.add_argument(
+        "--torch_device",
+        type=str,
+        default="auto",
+        help="Device for torch_mlp. Use auto, cpu, cuda, cuda:N, or mps.",
     )
     parser.add_argument(
         "--ffm_train_path",
@@ -1627,6 +1671,8 @@ if __name__ == "__main__":
         use_reduced_grid=bool(args.use_reduced_grid),
         hyperparameter=cast(Literal["grid", "fixed"], args.hyperparameter),
         eta_models=tuple(str(name) for name in args.eta_models),
+        use_gpu=bool(args.use_gpu),
+        torch_device=str(args.torch_device),
         ffm_train_path=str(args.ffm_train_path),
         ffm_predict_path=str(args.ffm_predict_path),
         ffm_threads=int(args.ffm_threads),
@@ -1800,7 +1846,7 @@ if __name__ == "__main__":
 #   --seed_start 0 \
 #   --seed_end 1
 
-# python experiment_eta_model.py \
+# nohup time python experiment_eta_model.py \
 #   --real_data \
 #   --real_data_path ./data/avazu/avazu_train_label_first.csv \
 #   --real_data_name Avazu \
@@ -1812,9 +1858,9 @@ if __name__ == "__main__":
 #   --N_ratio 0.2,0.2,0.6 \
 #   --seed_start 0 \
 #   --seed_end 9 \
-#   --score_dist
+#   --score_dist &
 
-# python experiment_eta_model.py \
+# nohup time python experiment_eta_model.py \
 #   --real_data \
 #   --real_data_path ./data/criteo_search/criteo_search_numeric.csv \
 #   --real_data_name CriteoSearch \
@@ -1828,4 +1874,4 @@ if __name__ == "__main__":
 #   --N_ratio 0.2,0.2,0.2,0.4 \
 #   --seed_start 0 \
 #   --seed_end 1 \
-#   --score_dist
+#   --score_dist &

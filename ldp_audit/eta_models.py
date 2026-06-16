@@ -1,18 +1,20 @@
 # eta_models.py
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
 import numpy as np
 import pandas as pd
+import torch
+from scipy import sparse
 from sklearn.compose import ColumnTransformer
-from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
@@ -24,6 +26,64 @@ def clip_eta(e: np.ndarray, eps: float = 1e-15) -> np.ndarray:
     """Numerical safety for eta in (0,1)."""
     e = np.asarray(e, dtype=float)
     return np.clip(e, eps, 1.0 - eps)
+
+
+def resolve_torch_device(device: str = "auto") -> str:
+    """Resolve a requested PyTorch device string without importing torch globally."""
+    requested: str = str(device).strip().lower()
+    if requested not in {"auto", "cpu", "cuda", "mps"} and not requested.startswith(
+        "cuda:"
+    ):
+        raise ValueError(
+            f"Unknown torch device: {device!r}. Use auto/cpu/cuda/mps/cuda:N."
+        )
+
+    try:
+        import torch
+    except Exception as exc:
+        if requested == "auto":
+            return "cpu"
+        raise RuntimeError(
+            f"PyTorch is required for torch_device={requested!r}, but importing torch failed."
+        ) from exc
+
+    if requested == "cpu":
+        return "cpu"
+    if requested == "cuda":
+        if torch.cuda.is_available():
+            return "cuda"
+        raise RuntimeError(
+            "torch_device='cuda' was requested, but CUDA is not available."
+        )
+    if requested.startswith("cuda:"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"torch_device={requested!r} was requested, but CUDA is not available."
+            )
+        try:
+            cuda_index = int(requested.split(":", 1)[1])
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid CUDA device string: {device!r}. Use cuda:N."
+            ) from exc
+        if cuda_index < 0 or cuda_index >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"torch_device={requested!r} was requested, but torch sees "
+                f"{torch.cuda.device_count()} CUDA device(s)."
+            )
+        return requested
+    if requested == "mps":
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        raise RuntimeError(
+            "torch_device='mps' was requested, but MPS is not available."
+        )
+
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 @dataclass(frozen=True)
@@ -296,6 +356,214 @@ class LibFFMClassifier:
                 f.write("\n")
 
 
+class TorchMLPClassifier:
+    """Small sklearn-like binary MLP classifier backed by PyTorch."""
+
+    def __init__(
+        self,
+        *,
+        hidden_layer_sizes: tuple[int, ...] = (64,),
+        alpha: float = 1e-4,
+        learning_rate_init: float = 1e-3,
+        batch_size: int = 512,
+        max_epochs: int = 500,
+        patience: int = 20,
+        device: str = "auto",
+        seed: int | None = None,
+    ) -> None:
+        self.hidden_layer_sizes: tuple[int, ...] = tuple(
+            int(x) for x in hidden_layer_sizes
+        )
+        self.alpha = float(alpha)
+        self.learning_rate_init = float(learning_rate_init)
+        self.batch_size = int(batch_size)
+        self.max_epochs = int(max_epochs)
+        self.patience = int(patience)
+        self.device_request = str(device)
+        self.seed: int | None = seed
+
+        self.device_: str | None = None
+        self._model: Any | None = None
+        self._input_dim: int | None = None
+        self._is_fitted: bool = False
+
+    def fit(self, X: np.ndarray | pd.DataFrame, y: np.ndarray) -> "TorchMLPClassifier":
+        return self.fit_with_validation(X, y, None, None)
+
+    def fit_with_validation(
+        self,
+        X: np.ndarray | pd.DataFrame,
+        y: np.ndarray,
+        X_val: np.ndarray | pd.DataFrame | None,
+        y_val: np.ndarray | None,
+    ) -> "TorchMLPClassifier":
+        try:
+            import torch
+            from torch import nn
+        except Exception as exc:
+            raise RuntimeError(
+                "PyTorch is required to use TorchMLPClassifier."
+            ) from exc
+
+        if self.seed is not None:
+            torch.manual_seed(int(self.seed))
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(int(self.seed))
+
+        X_np: np.ndarray = self._as_float32_matrix(X)
+        y_np: np.ndarray = np.asarray(y, dtype=np.float32).reshape(-1, 1)
+        if X_np.shape[0] != y_np.shape[0]:
+            raise ValueError(
+                f"X/y length mismatch: X has {X_np.shape[0]} rows, y has {y_np.shape[0]}."
+            )
+
+        X_val_np: np.ndarray | None = (
+            self._as_float32_matrix(X_val) if X_val is not None else None
+        )
+        y_val_np: np.ndarray | None = (
+            np.asarray(y_val, dtype=np.float32).reshape(-1, 1)
+            if y_val is not None
+            else None
+        )
+        if (
+            X_val_np is not None
+            and y_val_np is not None
+            and X_val_np.shape[0] != y_val_np.shape[0]
+        ):
+            raise ValueError(
+                f"X_val/y_val length mismatch: X_val has {X_val_np.shape[0]} rows, "
+                f"y_val has {y_val_np.shape[0]}."
+            )
+
+        self.device_ = resolve_torch_device(self.device_request)
+        device = torch.device(self.device_)
+        self._input_dim = int(X_np.shape[1])
+        model: nn.Module = self._build_model(self._input_dim, nn).to(device)
+        self._model = model
+        print(
+            "Building Torch MLP with params:",
+            {
+                "hidden_layer_sizes": self.hidden_layer_sizes,
+                "alpha": self.alpha,
+                "learning_rate_init": self.learning_rate_init,
+                "device": self.device_,
+            },
+        )
+
+        train_x_t: torch.Tensor = torch.from_numpy(X_np).to(device)
+        train_y_t: torch.Tensor = torch.from_numpy(y_np).to(device)
+        batch_size: int = max(1, min(self.batch_size, X_np.shape[0]))
+        optimizer = torch.optim.AdamW(
+            self._model.parameters(),
+            lr=self.learning_rate_init,
+            weight_decay=self.alpha,
+        )
+
+        def loss_fn(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+            signed_targets: torch.Tensor = targets.mul(2.0).sub(1.0)
+            return torch.nn.functional.softplus(-signed_targets * logits).mean()
+
+        val_x_t: torch.Tensor | None = (
+            torch.from_numpy(X_val_np).to(device) if X_val_np is not None else None
+        )
+        val_y_t: torch.Tensor | None = (
+            torch.from_numpy(y_val_np).to(device) if y_val_np is not None else None
+        )
+        best_state: dict[str, Any] | None = None
+        best_val_loss: float = np.inf
+        epochs_without_improvement: int = 0
+
+        for _epoch in range(max(1, self.max_epochs)):
+            self._model.train()
+            order: torch.Tensor = torch.randperm(train_x_t.shape[0], device=device)
+            for start in range(0, train_x_t.shape[0], batch_size):
+                batch_idx: torch.Tensor = order[start : start + batch_size]
+                xb: torch.Tensor = train_x_t.index_select(0, batch_idx)
+                yb: torch.Tensor = train_y_t.index_select(0, batch_idx)
+                optimizer.zero_grad(set_to_none=True)
+                logits: torch.Tensor = self._model(xb)
+                loss: torch.Tensor = loss_fn(logits, yb)
+                loss.backward()
+                optimizer.step()
+
+            if val_x_t is None or val_y_t is None:
+                continue
+
+            self._model.eval()
+            with torch.no_grad():
+                val_loss: float = float(
+                    loss_fn(self._model(val_x_t), val_y_t).detach().cpu().item()
+                )
+            if val_loss + 1e-7 < best_val_loss:
+                best_val_loss = val_loss
+                best_state = {
+                    k: v.detach().cpu().clone()
+                    for k, v in self._model.state_dict().items()
+                }
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= self.patience:
+                    break
+
+        if best_state is not None:
+            self._model.load_state_dict(best_state)
+            self._model.to(device)
+        self._is_fitted = True
+        return self
+
+    def predict_proba(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
+        if not self._is_fitted or self._model is None or self.device_ is None:
+            raise RuntimeError(
+                "TorchMLPClassifier must be fitted before predict_proba."
+            )
+        import torch
+
+        X_np: np.ndarray = self._as_float32_matrix(X)
+        device: torch.device = torch.device(self.device_)
+        self._model.eval()
+        probs: list[np.ndarray] = []
+        with torch.no_grad():
+            for start in range(0, X_np.shape[0], max(1, self.batch_size)):
+                xb: torch.Tensor = torch.from_numpy(
+                    X_np[start : start + self.batch_size]
+                ).to(device)
+                p1: np.ndarray = (
+                    torch.sigmoid(self._model(xb)).detach().cpu().numpy().reshape(-1)
+                )
+                probs.append(p1)
+        p1_all: np.ndarray = clip_eta(
+            np.concatenate(probs) if probs else np.empty(0, dtype=np.float64)
+        )
+        return np.column_stack([1.0 - p1_all, p1_all])
+
+    def cleanup(self) -> None:
+        self._model = None
+
+    @staticmethod
+    def _as_float32_matrix(X: Any) -> np.ndarray:
+        if X is None:
+            raise ValueError("X must not be None.")
+        if sparse.issparse(X):
+            X = X.toarray()
+        elif isinstance(X, pd.DataFrame):
+            X = X.to_numpy()
+        arr: np.ndarray = np.asarray(X, dtype=np.float32)
+        if arr.ndim != 2:
+            raise ValueError(f"X must be 2-dimensional, got shape={arr.shape}.")
+        return np.ascontiguousarray(arr)
+
+    def _build_model(self, input_dim: int, nn: Any) -> Any:
+        layers: list[Any] = []
+        prev = int(input_dim)
+        for hidden_dim in self.hidden_layer_sizes:
+            layers.append(nn.Linear(prev, int(hidden_dim)))
+            layers.append(nn.ReLU())
+            prev = int(hidden_dim)
+        layers.append(nn.Linear(prev, 1))
+        return nn.Sequential(*layers)
+
+
 def _build_logreg(params: dict[str, Any], seed: int) -> LogisticRegression:
     print("Building Logistic Regression with params:", params)
     # L2 only; saga handles both dense numeric data and sparse one-hot features.
@@ -337,6 +605,10 @@ def _build_mlp(params: dict[str, Any], seed: int) -> MLPClassifier:
         n_iter_no_change=20,
         **params,
     )
+
+
+def _build_torch_mlp(params: dict[str, Any], seed: int) -> TorchMLPClassifier:
+    return TorchMLPClassifier(seed=seed, **params)
 
 
 def _build_libffm(params: dict[str, Any], seed: int) -> LibFFMClassifier:
@@ -498,6 +770,48 @@ def get_reduced_eta_model_configs() -> list[EtaModelConfig]:
         EtaModelConfig("rf", rf_grid, False, _build_rf),
         EtaModelConfig("mlp", mlp_grid, True, _build_mlp),
     ]
+
+
+def get_torch_mlp_eta_model_configs(
+    *,
+    device: str = "auto",
+    reduced: bool = True,
+) -> list[EtaModelConfig]:
+    """
+    PyTorch MLP configs.  With device="auto", CUDA/MPS is used when available
+    and CPU is used otherwise.
+    """
+    if reduced:
+        grid: list[dict[str, Any]] = [
+            {
+                "hidden_layer_sizes": hs,
+                "alpha": a,
+                "learning_rate_init": lr,
+                "device": device,
+                "max_epochs": 500,
+                "patience": 20,
+                "batch_size": 512,
+            }
+            for hs in [(64,), (128,)]
+            for a in [1e-5, 1e-4, 1e-3]
+            for lr in [1e-3, 1e-2]
+        ]
+    else:
+        grid = [
+            {
+                "hidden_layer_sizes": hs,
+                "alpha": a,
+                "learning_rate_init": lr,
+                "device": device,
+                "max_epochs": 500,
+                "patience": 20,
+                "batch_size": 512,
+            }
+            for hs in [(32,), (64,), (128,)]
+            for a in [1e-5, 1e-4, 1e-3]
+            for lr in [1e-4, 1e-3, 1e-2]
+        ]
+    return [EtaModelConfig("torch_mlp", grid, True, _build_torch_mlp)]
 
 
 def get_libffm_eta_model_configs(
