@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, Callable
 
 import numpy as np
 from scipy.stats import multivariate_normal , chi2
@@ -134,14 +134,14 @@ def sample_x_given_y_truncated(
     # バッチサイズ自動設定：とりあえず n の数倍を投げる（受理率が高い前提）
     if batch_size is None:
         # n が小さいときは最低 1024、n が大きいときは 4n くらい
-        batch_size = max(1024, 4 * n)
+        batch_size_max: int = max(1024, 4 * n)
 
     accepted: list[np.ndarray] = []
     total_acc = 0
 
     for _round in range(max_rounds):
         # 候補を生成
-        X_cand = np.asarray(comp.rvs(size=batch_size, random_state=rng))
+        X_cand = np.asarray(comp.rvs(size=batch_size_max, random_state=rng))
         # 受理判定
         norms = np.linalg.norm(X_cand, axis=1)
         mask = norms <= B
@@ -154,9 +154,9 @@ def sample_x_given_y_truncated(
                 return X_all[:n]
 
         # まだ足りないとき：残り必要数に応じて batch を少し調整（任意）
-        remaining = n - total_acc
-        if remaining > 0 and remaining < batch_size // 4:
-            batch_size = max(1024, 4 * remaining)
+        remaining: int = n - total_acc
+        if remaining > 0 and remaining < batch_size_max // 4:
+            batch_size_max = max(1024, 4 * remaining)
 
     raise RuntimeError(
         f"sample_x_given_y_truncated: failed to collect n={n} samples "
@@ -234,8 +234,34 @@ def log_Rmax_gaussian(spec: MixtureSpec | None, B: float = 0.01) -> float:
             if j == k:
                 continue
             a = (mus[j] - mus[k]) / sigma2  # shape (d,)
-            b: float = -0.5 * (mus[j] @ mus[j] - mus[k] @ mus[k]) / sigma2
-            val: float = abs(b) + np.linalg.norm(a) * B  # sup_{||x||<=B} |a^T x + b|
+            b: float = -0.5 * (mus[j] @ mus[j] - mus[k] @ mus[k]) / sigma2  # type: ignore
+            val: float = abs(b) + np.linalg.norm(a) * B  # sup_{||x||<=B} |a^T x + b|   #type: ignore
             max_val: float = max(max_val, val)
 
     return float(max_val)
+
+
+def sample_attack_trainset_from_spec(
+    n: int,
+    spec: MixtureSpec,
+    rng: np.random.Generator,
+    B: float,
+    project_fn: Callable[[np.ndarray, float], np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Attackers' auxiliary labeled dataset (X,y) generated from the same process.
+    y ~ Uniform{0,1}, X|y ~ truncated Gaussian, then projected onto L2 ball.
+    """
+    y: np.ndarray = rng.integers(0, spec.num_classes, size=n, endpoint=False).astype(np.int64)
+
+    X: np.ndarray = np.empty((n, spec.d), dtype=np.float64)
+    for cls in range(spec.num_classes):
+        m: np.ndarray = y == cls
+        cnt = int(m.sum())
+        if cnt == 0:
+            continue
+        Xc: np.ndarray = sample_x_given_y_truncated(n=cnt, spec=spec, y=cls, rng=rng, B=B)
+        Xc = project_fn(Xc, B)
+        X[m] = Xc
+
+    return X, y
