@@ -25,6 +25,59 @@ def _mus(spec: MixtureSpec) -> list[np.ndarray]:
     return mus
 
 
+def class_mean(spec: MixtureSpec, y: int) -> np.ndarray:
+    if spec is None:
+        raise ValueError("spec must be provided")
+    if not (0 <= int(y) < spec.num_classes):
+        raise ValueError(f"y must be in [0, {spec.num_classes - 1}]")
+    mu: np.ndarray = np.zeros(spec.d, dtype=float)
+    mu[int(y) % spec.d] = spec.mean_shift
+    return mu
+
+
+def gaussian_x_lr_affine_params(
+    spec: MixtureSpec | None,
+    *,
+    y_plus: int = 1,
+    y_minus: int = 0,
+) -> tuple[np.ndarray, float]:
+    """
+    Return w, beta for log p(x|Y=y_plus) / p(x|Y=y_minus) = w^T x + beta.
+    """
+    if spec is None:
+        raise ValueError("spec must be provided")
+    sigma2: float = float(spec.sigma) ** 2
+    if sigma2 <= 0.0:
+        raise ValueError("spec.sigma must be positive")
+    mu_plus: np.ndarray = class_mean(spec, y_plus)
+    mu_minus: np.ndarray = class_mean(spec, y_minus)
+    w: np.ndarray = (mu_plus - mu_minus) / sigma2
+    beta: float = -0.5 * float(mu_plus @ mu_plus - mu_minus @ mu_minus) / sigma2
+    return w, beta
+
+
+def gaussian_x_lr_score_std(
+    spec: MixtureSpec | None,
+    *,
+    y_plus: int = 1,
+    y_minus: int = 0,
+) -> float:
+    if spec is None:
+        raise ValueError("spec must be provided")
+    w, _ = gaussian_x_lr_affine_params(spec, y_plus=y_plus, y_minus=y_minus)
+    return float(spec.sigma) * float(np.linalg.norm(w))
+
+
+def log_Rmax_complete_gaussian(
+    spec: MixtureSpec | None,
+    *,
+    epsilon: float,
+    B: float,
+) -> float:
+    """R_max for the complete score (X, randomized-response output)."""
+    return float(log_Rmax_gaussian(spec, B=B) + float(epsilon))
+
+
 def _make_gaussian_components(spec: MixtureSpec) -> list[multivariate_normal]: # type: ignore
     """クラスごとの多変量正規分布（同一共分散）を作る。"""
     if spec.num_classes < 2:
@@ -141,7 +194,7 @@ def sample_x_given_y_truncated(
 
     for _round in range(max_rounds):
         # 候補を生成
-        X_cand = np.asarray(comp.rvs(size=batch_size_max, random_state=rng))
+        X_cand = np.atleast_2d(np.asarray(comp.rvs(size=batch_size_max, random_state=rng)))
         # 受理判定
         norms = np.linalg.norm(X_cand, axis=1)
         mask = norms <= B
@@ -151,7 +204,7 @@ def sample_x_given_y_truncated(
             total_acc += X_ok.shape[0]
             if total_acc >= n:
                 X_all = np.vstack(accepted)
-                return X_all[:n]
+                return np.atleast_2d(X_all[:n])
 
         # まだ足りないとき：残り必要数に応じて batch を少し調整（任意）
         remaining: int = n - total_acc
@@ -171,14 +224,18 @@ def sample_x_given_y(
     if spec is None:
         raise ValueError("spec must be provided")
     comps: list[multivariate_normal] = _make_gaussian_components(spec)  # type: ignore
-    return np.asarray(comps[y].rvs(size=n, random_state=rng))
+    return np.atleast_2d(np.asarray(comps[y].rvs(size=n, random_state=rng)))
 
 
 def posterior_probs_from_x(X: np.ndarray, spec: MixtureSpec | None) -> np.ndarray:
     if spec is None:
         raise ValueError("spec must be provided")
     comps: list[multivariate_normal] = _make_gaussian_components(spec)  # type: ignore
-    logpdf: np.ndarray = np.stack([comps[j].logpdf(X) for j in range(spec.num_classes)], axis=1)
+    X_arr: np.ndarray = np.atleast_2d(np.asarray(X, dtype=float))
+    logpdf: np.ndarray = np.stack(
+        [np.atleast_1d(comps[j].logpdf(X_arr)) for j in range(spec.num_classes)],
+        axis=1,
+    )
     m: np.ndarray = logpdf.max(axis=1, keepdims=True)
     probs: np.ndarray = np.exp(logpdf - m)
     probs /= probs.sum(axis=1, keepdims=True)

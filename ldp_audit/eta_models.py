@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import torch
 from scipy import sparse
+from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import CountVectorizer
@@ -356,7 +357,7 @@ class LibFFMClassifier:
                 f.write("\n")
 
 
-class TorchMLPClassifier:
+class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
     """Small sklearn-like binary MLP classifier backed by PyTorch."""
 
     def __init__(
@@ -369,17 +370,20 @@ class TorchMLPClassifier:
         max_epochs: int = 500,
         patience: int = 20,
         device: str = "auto",
+        model_name: str = "Torch MLP",
         seed: int | None = None,
     ) -> None:
-        self.hidden_layer_sizes: tuple[int, ...] = tuple(
-            int(x) for x in hidden_layer_sizes
-        )
-        self.alpha = float(alpha)
-        self.learning_rate_init = float(learning_rate_init)
-        self.batch_size = int(batch_size)
-        self.max_epochs = int(max_epochs)
-        self.patience = int(patience)
-        self.device_request = str(device)
+        # Keep constructor parameters unchanged so sklearn.clone/get_params can
+        # treat this class as a regular estimator. Convert values only where
+        # they are consumed during fitting.
+        self.hidden_layer_sizes: tuple[int, ...] = hidden_layer_sizes
+        self.alpha: float = alpha
+        self.learning_rate_init: float = learning_rate_init
+        self.batch_size: int = batch_size
+        self.max_epochs: int = max_epochs
+        self.patience: int = patience
+        self.device: str = device
+        self.model_name: str = model_name
         self.seed: int | None = seed
 
         self.device_: str | None = None
@@ -435,13 +439,13 @@ class TorchMLPClassifier:
                 f"y_val has {y_val_np.shape[0]}."
             )
 
-        self.device_ = resolve_torch_device(self.device_request)
+        self.device_ = resolve_torch_device(self.device)
         device = torch.device(self.device_)
         self._input_dim = int(X_np.shape[1])
         model: nn.Module = self._build_model(self._input_dim, nn).to(device)
         self._model = model
         print(
-            "Building Torch MLP with params:",
+            f"Building {self.model_name} with params:",
             {
                 "hidden_layer_sizes": self.hidden_layer_sizes,
                 "alpha": self.alpha,
@@ -511,6 +515,9 @@ class TorchMLPClassifier:
             self._model.to(device)
         self._is_fitted = True
         return self
+
+    def __sklearn_is_fitted__(self) -> bool:
+        return self._is_fitted
 
     def predict_proba(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
         if not self._is_fitted or self._model is None or self.device_ is None:
@@ -609,6 +616,10 @@ def _build_mlp(params: dict[str, Any], seed: int) -> MLPClassifier:
 
 def _build_torch_mlp(params: dict[str, Any], seed: int) -> TorchMLPClassifier:
     return TorchMLPClassifier(seed=seed, **params)
+
+
+def _build_torch_dnn(params: dict[str, Any], seed: int) -> TorchMLPClassifier:
+    return TorchMLPClassifier(seed=seed, model_name="Torch DNN", **params)
 
 
 def _build_libffm(params: dict[str, Any], seed: int) -> LibFFMClassifier:
@@ -812,6 +823,53 @@ def get_torch_mlp_eta_model_configs(
             for lr in [1e-4, 1e-3, 1e-2]
         ]
     return [EtaModelConfig("torch_mlp", grid, True, _build_torch_mlp)]
+
+
+def get_torch_dnn_eta_model_configs(
+    *,
+    device: str = "auto",
+    reduced: bool = True,
+) -> list[EtaModelConfig]:
+    """
+    Deeper PyTorch MLP configs intended for numeric real-data benchmarks such as
+    SUSY.  The architecture candidates have at least two hidden layers, so this
+    family is reported separately from the shallow torch_mlp baseline.
+    """
+    if reduced:
+        grid: list[dict[str, Any]] = [
+            {
+                "hidden_layer_sizes": hs,
+                "alpha": a,
+                "learning_rate_init": lr,
+                "device": device,
+                "max_epochs": 500,
+                "patience": 20,
+                "batch_size": 512,
+            }
+            for hs in [(128, 128), (256, 128, 64)]
+            for a in [1e-5, 1e-4, 1e-3]
+            for lr in [1e-3, 1e-2]
+        ]
+    else:
+        grid = [
+            {
+                "hidden_layer_sizes": hs,
+                "alpha": a,
+                "learning_rate_init": lr,
+                "device": device,
+                "max_epochs": 500,
+                "patience": 20,
+                "batch_size": 512,
+            }
+            for hs in [
+                (128, 128),
+                (256, 128, 64),
+                (300, 300, 300, 300, 300),
+            ]
+            for a in [1e-5, 1e-4, 1e-3]
+            for lr in [1e-4, 1e-3, 1e-2]
+        ]
+    return [EtaModelConfig("torch_dnn", grid, True, _build_torch_dnn)]
 
 
 def get_libffm_eta_model_configs(

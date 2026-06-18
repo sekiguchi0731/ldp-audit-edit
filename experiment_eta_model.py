@@ -22,6 +22,7 @@ from ldp_audit.eta_models import (
     fit_and_select_eta_model,
     get_default_eta_model_configs,
     get_fixed_logreg_eta_model_configs,
+    get_torch_dnn_eta_model_configs,
     get_libffm_eta_model_configs,
     get_reduced_eta_model_configs,
     get_torch_mlp_eta_model_configs,
@@ -105,7 +106,9 @@ def _resolve_eta_model_configs(cfg: EtaExperimentConfig) -> list[EtaModelConfig]
     ):
         requested = ["logreg"]
 
-    needs_torch: bool = bool(cfg.use_gpu or "torch_mlp" in requested)
+    needs_torch: bool = bool(
+        cfg.use_gpu or "torch_mlp" in requested or "torch_dnn" in requested
+    )
     resolved_torch_device: str = resolve_torch_device(cfg.torch_device) if needs_torch else "cpu"
     if cfg.use_gpu:
         if resolved_torch_device != "cpu":
@@ -134,6 +137,16 @@ def _resolve_eta_model_configs(cfg: EtaExperimentConfig) -> list[EtaModelConfig]
             {
                 model_cfg.name: model_cfg
                 for model_cfg in get_torch_mlp_eta_model_configs(
+                    device=cfg.torch_device,
+                    reduced=cfg.use_reduced_grid,
+                )
+            }
+        )
+    if "torch_dnn" in requested:
+        by_name.update(
+            {
+                model_cfg.name: model_cfg
+                for model_cfg in get_torch_dnn_eta_model_configs(
                     device=cfg.torch_device,
                     reduced=cfg.use_reduced_grid,
                 )
@@ -1539,11 +1552,21 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eta_models",
         nargs="+",
-        choices=["logreg", "svm_rbf", "rf", "mlp", "ffm", "torch_mlp", "all"],
+        choices=[
+            "logreg",
+            "svm_rbf",
+            "rf",
+            "mlp",
+            "ffm",
+            "torch_mlp",
+            "torch_dnn",
+            "all",
+        ],
         default=["logreg", "svm_rbf", "rf", "mlp"],
         help=(
             "Eta model families to run. Add 'ffm' to use libffm, add "
-            "'torch_mlp' to use the optional PyTorch MLP, or use 'all'."
+            "'torch_mlp' or 'torch_dnn' to use optional PyTorch neural nets, "
+            "or use 'all' for non-torch baseline families."
         ),
     )
     parser.add_argument(
@@ -1865,13 +1888,42 @@ if __name__ == "__main__":
 #   --real_data_path ./data/criteo_search/criteo_search_numeric.csv \
 #   --real_data_name CriteoSearch \
 #   --criteo_search_drop_product_price \
-#   --output_root ./results/20260604/criteo_search_preprocessed_no_price_smoke \
+#   --output_root ./results/20260616/criteo_search_preprocessed_no_price_smoke \
 #   --evaluate_both_reports \
 #   --use_reduced_grid \
-#   --eta_models logreg ffm mlp \
+#   --eta_models torch_mlp \
 #   --selection eps_lower \
-#   --N_total 100000 \
+#   --N_total 15995634 \
 #   --N_ratio 0.2,0.2,0.2,0.4 \
 #   --seed_start 0 \
-#   --seed_end 1 \
+#   --seed_end 4 \
+#   --tau_selection cN \
+#   --use_gpu \
+#   --torch_device auto \
 #   --score_dist &
+
+# CUDA_VISIBLE_DEVICES=0 \
+# OMP_NUM_THREADS=4 \
+# MKL_NUM_THREADS=4 \
+# OPENBLAS_NUM_THREADS=4 \
+# NUMEXPR_NUM_THREADS=4 \
+# taskset -c 16-19 \
+# nohup python experiment_eta_model.py \
+#   --real_data \
+#   --real_data_path ./data/criteo_search/criteo_search_numeric.csv \
+#   --real_data_name CriteoSearch \
+#   --eta_models torch_mlp \
+#   --torch_device cuda \
+#   --use_reduced_grid \
+#   --N_total 100000 \
+#   --N_ratio 0.2,0.2,0.2,0.4 \
+#   --output_root ./results/20260616/criteo_search_preprocessed_smoke_torch_mlp \
+#   --evaluate_both_reports \
+#   --selection eps_lower \
+#   --tau_selection cN \
+#   --score_dist \
+#   --seed_start 0 \
+#   --seed_end 4 \
+#   > torch_mlp_criteo.log 2>&1 &
+
+# echo $!

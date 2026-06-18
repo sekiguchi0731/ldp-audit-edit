@@ -1,16 +1,49 @@
 # General imports
 import warnings
 from collections import defaultdict
-from typing import Any, Literal, Self, Callable, Sequence, cast
+from typing import Any, Literal, NoReturn, Self, Callable, Sequence, cast
 
-from matplotlib.pylab import Generator
 import pandas as pd
-from sklearn.pipeline import Pipeline
 import numpy as np
 import psutil
 
 # Imports for parallelization
-import ray
+try:
+    import ray
+except ModuleNotFoundError:
+    class _MissingRayRemote:
+        def __init__(self, func) -> None:
+            self.func = func
+
+        def remote(self, *args, **kwargs) -> NoReturn:
+            raise ModuleNotFoundError(
+                "ray is required for non-LRT parallel audits. Install ray or run an LRT/decomp path."
+            )
+
+    class _MissingRay:
+        @staticmethod
+        def remote(func=None, **_kwargs):# -> Callable[..., _MissingRayRemote] | _MissingRayRemote:
+            if func is None:
+                return lambda f: _MissingRayRemote(f)
+            return _MissingRayRemote(func)
+
+        @staticmethod
+        def shutdown() -> None:
+            return None
+
+        @staticmethod
+        def init(*_args, **_kwargs) -> NoReturn:
+            raise ModuleNotFoundError(
+                "ray is required for non-LRT parallel audits. Install ray or run an LRT/decomp path."
+            )
+
+        @staticmethod
+        def get(_refs):
+            raise ModuleNotFoundError(
+                "ray is required for non-LRT parallel audits. Install ray or run an LRT/decomp path."
+            )
+
+    ray = _MissingRay()
 import xxhash
 
 from scipy.optimize import OptimizeResult, minimize_scalar
@@ -39,6 +72,7 @@ from .simulation import (
     MixtureSpec,
     log_Rmax_gaussian,
     posterior_probs_from_x,
+    gaussian_x_lr_affine_params,
     sample_x_given_y_truncated,
     set_B_from_quantile,
     sample_attack_trainset_from_spec,
@@ -256,7 +290,8 @@ class LDPAuditor:
             "OUE_pure_ldp_pck": self.audit_oue_pure_ldp_pck,
             "LRT": "SPECIAL",  # 特殊扱い（run_audit 内で分岐して直に実行）
             "LRT_tilde1": "SPECIAL",  # tilde y = 1 only
-            "LRT_indirect": "SPECIAL",  # indirect
+            "LRT_decomp": "SPECIAL",  # X-only decomposition audit
+            "LRT_indirect": "SPECIAL",  # backwards-compatible alias for LRT_decomp
         }
 
     def set_params(self, **params) -> Self:
@@ -992,7 +1027,7 @@ class LDPAuditor:
         - indirect_LRT_hat: y=0 側 predicted eta から tau,q
         - complete_LRT_hat: y=0 側の complete-LRT pseudo-probability から tau,q
         """
-        rng_local: Generator = np.random.default_rng(rng_seed_for_val)
+        rng_local: np.random.Generator = np.random.default_rng(rng_seed_for_val)
 
         def score_fn(model) -> float:
             # attack_for_selection に応じて null 側スコアから tau,q を作る
@@ -1002,7 +1037,7 @@ class LDPAuditor:
                     predict_eta(model, X_null)
                 )
             elif attack_for_selection == "complete_LRT_hat":
-                rng_tau: Generator = np.random.default_rng(rng_seed_for_val + 12345)
+                rng_tau: np.random.Generator = np.random.default_rng(rng_seed_for_val + 12345)
                 scores_null = self._sample_p_theta_hat(
                     y_input=y_null,
                     n=int(np.sum(y_val == y_null)),
@@ -1080,11 +1115,11 @@ class LDPAuditor:
         if tau_selection not in ("cN", "theory"):
             raise ValueError("tau_selection must be either 'cN' or 'theory'.")
 
-        rng: Generator = np.random.default_rng(seed)
-        rng_train: Generator = np.random.default_rng(rng.integers(1 << 32))
-        rng_val: Generator = np.random.default_rng(rng.integers(1 << 32))
-        rng_threshold: Generator = np.random.default_rng(rng.integers(1 << 32))
-        rng_test: Generator = np.random.default_rng(rng.integers(1 << 32))
+        rng: np.random.Generator = np.random.default_rng(seed)
+        rng_train: np.random.Generator = np.random.default_rng(rng.integers(1 << 32))
+        rng_val: np.random.Generator = np.random.default_rng(rng.integers(1 << 32))
+        rng_threshold: np.random.Generator = np.random.default_rng(rng.integers(1 << 32))
+        rng_test: np.random.Generator = np.random.default_rng(rng.integers(1 << 32))
 
         # --- train/val データを用意 （simulation data 用） ---
         if X_train is None:
@@ -1205,7 +1240,7 @@ class LDPAuditor:
                         predict_eta(model, X_null)
                     )
                 elif attack_name == "complete_LRT_hat":
-                    rng_tau: Generator = np.random.default_rng(int(rng.integers(1 << 31)))
+                    rng_tau: np.random.Generator = np.random.default_rng(int(rng.integers(1 << 31)))
                     X_null = self._take_feature_rows(X_threshold, y_threshold == y_null)
                     eta_hat_null: np.ndarray = predict_eta(model, X_null)
                     ytilde_null: np.ndarray = grr_sample_binary(
@@ -1221,7 +1256,7 @@ class LDPAuditor:
                 else:
                     scores_null = predict_eta(model, self._take_feature_rows(X_threshold, y_threshold == y_null))
 
-                rng_for_attack: Generator = np.random.default_rng(rng_test.integers(1 << 32))
+                rng_for_attack: np.random.Generator = np.random.default_rng(rng_test.integers(1 << 32))
                 if tau_selection == "cN":
                     tau, q = dp_sniper_threshold_from_scores(scores_null, c=self.c)
                     tau = float(np.clip(tau, 1e-15, 1.0 - 1e-15))
@@ -1353,6 +1388,324 @@ class LDPAuditor:
         score_x: np.ndarray = np.log(eta) - np.log(1.0 - eta)   # logit(eta)
         return score_x
 
+    def _class_mean_from_spec(self, y: int) -> np.ndarray:
+        if self.spec is None:
+            raise ValueError("spec must be set.")
+        mu: np.ndarray = np.zeros(self.spec.d, dtype=np.float64)
+        mu[int(y) % self.spec.d] = float(self.spec.mean_shift)
+        return mu
+
+    def _x_lr_affine_params(self, y_plus: int = 1, y_minus: int = 0) -> tuple[np.ndarray, float]:
+        """
+        Return w, beta for log p(x|Y=y_plus) / p(x|Y=y_minus) = w^T x + beta.
+        """
+        return gaussian_x_lr_affine_params(
+            self.spec,
+            y_plus=y_plus,
+            y_minus=y_minus,
+        )
+
+    def true_score_tail_lipschitz_bound(
+        self,
+        *,
+        y_plus: int = 1,
+        y_minus: int = 0,
+        rho_lower: float | None = None,
+    ) -> float:
+        """
+        Bound the density of the true Gaussian log-LR score under either class.
+
+        This is a Lipschitz constant for the tail probabilities a(t), b(t), not
+        for log a(t), log b(t).  With truncation to the common L2 ball, the
+        acceptance probability is lower-bounded by 1 - rmax_alpha.
+        """
+        if self.spec is None:
+            raise ValueError("spec must be set.")
+        w, _ = self._x_lr_affine_params(y_plus=y_plus, y_minus=y_minus)
+        tau: float = float(self.spec.sigma) * float(np.linalg.norm(w))
+        if tau <= 0.0 or not np.isfinite(tau):
+            raise ValueError(
+                "The true LR score is degenerate. Check that the class means differ."
+            )
+        rho: float = float(1.0 - self.rmax_alpha if rho_lower is None else rho_lower)
+        rho = max(rho, 1e-300)
+        return float(1.0 / (rho * tau * np.sqrt(2.0 * np.pi)))
+
+    def true_score_log_tail_lipschitz_bound(
+        self,
+        *,
+        c_floor: float,
+        y_plus: int = 1,
+        y_minus: int = 0,
+        rho_lower: float | None = None,
+    ) -> float:
+        """
+        Conservative Lipschitz bound for log a(t), log b(t) on a region where
+        both tail probabilities are at least c_floor.
+        """
+        c_safe: float = max(float(c_floor), 1e-300)
+        return self.true_score_tail_lipschitz_bound(
+            y_plus=y_plus,
+            y_minus=y_minus,
+            rho_lower=rho_lower,
+        ) / c_safe
+
+    def _directional_score_range_on_ball(self, y_plus: int, y_minus: int) -> tuple[float, float]:
+        w, beta = self._x_lr_affine_params(y_plus=y_plus, y_minus=y_minus)
+        radius: float = float(np.linalg.norm(w)) * float(self.B)
+        return float(beta - radius), float(beta + radius)
+
+    @staticmethod
+    def _uniform_threshold_grid(
+        *,
+        low: float,
+        high: float,
+        width: float,
+        max_grid_size: int | None = None,
+    ) -> np.ndarray:
+        if not np.isfinite(width) or width <= 0.0:
+            raise ValueError(f"grid width must be positive and finite, got {width}.")
+        lo: float = float(min(low, high))
+        hi: float = float(max(low, high))
+        n_steps: int = int(np.ceil(max(hi - lo, 0.0) / float(width)))
+        grid_size: int = n_steps + 1
+        if max_grid_size is not None and grid_size > int(max_grid_size):
+            raise ValueError(
+                f"The theory grid would contain {grid_size} thresholds, exceeding "
+                f"max_grid_size={max_grid_size}. Increase --max_grid_size or use a "
+                "smaller n/beta setting."
+            )
+        grid: np.ndarray = lo + float(width) * np.arange(grid_size, dtype=np.float64)
+        if grid.size == 0:
+            return np.array([lo], dtype=np.float64)
+        grid[-1] = min(float(grid[-1]), hi)
+        return np.unique(grid)
+
+    def _sample_directional_x_scores(
+        self,
+        *,
+        y_input: int,
+        y_plus: int,
+        y_minus: int,
+        n: int,
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        base_score: np.ndarray = self._sample_score_x(y_input, n, rng)
+        if (y_plus, y_minus) == (1, 0):
+            return base_score
+        if (y_plus, y_minus) == (0, 1):
+            return -base_score
+        raise ValueError("finite-grid decomp audit currently supports binary directions only.")
+
+    def _evaluate_decomp_direction_finite_grid_cp(
+        self,
+        *,
+        y_plus: int,
+        y_minus: int,
+        grid: np.ndarray,
+        c_n: float,
+        alpha_cp: float,
+        rng: np.random.Generator,
+        n_plus: int,
+        n_minus: int,
+    ) -> dict[str, Any]:
+        s_plus: np.ndarray = self._sample_directional_x_scores(
+            y_input=y_plus,
+            y_plus=y_plus,
+            y_minus=y_minus,
+            n=n_plus,
+            rng=rng,
+        )
+        s_minus: np.ndarray = self._sample_directional_x_scores(
+            y_input=y_minus,
+            y_plus=y_plus,
+            y_minus=y_minus,
+            n=n_minus,
+            rng=rng,
+        )
+
+        k_plus: np.ndarray = self._counts_above_thresholds(s_plus, grid)
+        k_minus: np.ndarray = self._counts_above_thresholds(s_minus, grid)
+        a_hat: np.ndarray = k_plus / float(n_plus)
+        b_hat: np.ndarray = k_minus / float(n_minus)
+
+        a_lo, a_hi = self._beta_cp_interval(
+            k_plus,
+            n_plus,
+            one_sided_alpha=alpha_cp,
+        )
+        b_lo, b_hi = self._beta_cp_interval(
+            k_minus,
+            n_minus,
+            one_sided_alpha=alpha_cp,
+        )
+
+        eps_lower: np.ndarray = np.full(grid.shape, -np.inf, dtype=np.float64)
+        feasible: np.ndarray = b_hat >= float(c_n)
+        valid_lower: np.ndarray = feasible & (a_lo > 0.0) & (b_hi > 0.0)
+        eps_lower[valid_lower] = np.log(a_lo[valid_lower] / b_hi[valid_lower])
+
+        eps_emp: np.ndarray = np.full(grid.shape, -np.inf, dtype=np.float64)
+        valid_emp: np.ndarray = (a_hat > 0.0) & (b_hat > 0.0)
+        eps_emp[valid_emp] = np.log(a_hat[valid_emp] / b_hat[valid_emp])
+
+        eps_upper: np.ndarray = np.full(grid.shape, np.inf, dtype=np.float64)
+        valid_upper: np.ndarray = (a_hi > 0.0) & (b_lo > 0.0)
+        eps_upper[valid_upper] = np.log(a_hi[valid_upper] / b_lo[valid_upper])
+
+        if np.any(np.isfinite(eps_lower)):
+            best_idx: int = int(np.nanargmax(eps_lower))
+        else:
+            best_idx = 0
+
+        return {
+            "direction": f"{y_plus}{y_minus}",
+            "y_plus": int(y_plus),
+            "y_minus": int(y_minus),
+            "tau": float(grid[best_idx]),
+            "tau_selected_index": int(best_idx),
+            "tau_grid_size": int(grid.size),
+            "tau_grid_feasible_size": int(np.sum(feasible)),
+            "TP": int(k_plus[best_idx]),
+            "FP": int(k_minus[best_idx]),
+            "N_plus_eval": int(n_plus),
+            "N_minus_eval": int(n_minus),
+            "a_hat": float(a_hat[best_idx]),
+            "b_hat": float(b_hat[best_idx]),
+            "a_ci": (float(a_lo[best_idx]), float(a_hi[best_idx])),
+            "b_ci": (float(b_lo[best_idx]), float(b_hi[best_idx])),
+            "eps_emp_x": float(eps_emp[best_idx]),
+            "eps_lower_x": float(eps_lower[best_idx]),
+            "eps_upper_x": float(eps_upper[best_idx]),
+            "alpha_cp": float(alpha_cp),
+        }
+
+    def evaluate_decomp_finite_grid_cp(
+        self,
+        *,
+        beta: float,
+        failure_delta: float | None = None,
+        lipschitz_bound: float | None = None,
+        lipschitz_c_floor: float | None = None,
+        n_plus_eval: int | None = None,
+        n_minus_eval: int | None = None,
+        max_grid_size: int | None = None,
+    ) -> dict[str, Any]:
+        """
+        Algorithm 1 style finite-grid CP-LCB decomp audit with the true score.
+
+        c_n = n_min^{-beta}.  If lipschitz_bound is not supplied, a conservative
+        bound for log a/log b on the clipped region is computed as
+        density_bound / lipschitz_c_floor, with lipschitz_c_floor defaulting to c_n.
+        """
+        if self.spec is None:
+            raise ValueError("spec must be set for finite-grid decomp audit.")
+        beta_float: float = float(beta)
+        if not (0.0 < beta_float < 1.0):
+            raise ValueError(f"beta must be in (0, 1), got {beta}.")
+
+        delta_eff: float = float(self.alpha if failure_delta is None else failure_delta)
+        if not (0.0 < delta_eff < 1.0):
+            raise ValueError(f"failure_delta must be in (0, 1), got {delta_eff}.")
+
+        n_plus: int = int(self.nb_trials if n_plus_eval is None else n_plus_eval)
+        n_minus: int = int(self.nb_trials if n_minus_eval is None else n_minus_eval)
+        n_min: int = min(n_plus, n_minus)
+        if n_min <= 0:
+            raise ValueError("nb_trials must be positive for finite-grid decomp audit.")
+
+        c_n: float = float(n_min ** (-beta_float))
+        c_for_lipschitz: float = float(c_n if lipschitz_c_floor is None else lipschitz_c_floor)
+        L_log: float = float(
+            lipschitz_bound
+            if lipschitz_bound is not None
+            else self.true_score_log_tail_lipschitz_bound(c_floor=c_for_lipschitz)
+        )
+        if not np.isfinite(L_log) or L_log <= 0.0:
+            raise ValueError(f"lipschitz bound must be positive and finite, got {L_log}.")
+
+        h_n: float = float((1.0 / (4.0 * L_log)) * n_min ** (-(1.0 - beta_float) / 2.0))
+        directions: tuple[tuple[int, int], ...] = ((1, 0), (0, 1))
+
+        grids: dict[str, np.ndarray] = {}
+        total_cp_events: int = 0
+        for y_plus, y_minus in directions:
+            low, high = self._directional_score_range_on_ball(y_plus, y_minus)
+            grid: np.ndarray[tuple[Any, ...], np.dtype[Any]] = self._uniform_threshold_grid(
+                low=low,
+                high=high,
+                width=h_n,
+                max_grid_size=max_grid_size,
+            )
+            grids[f"{y_plus}{y_minus}"] = grid
+            total_cp_events += 2 * int(grid.size) + 2
+
+        alpha_cp: float = float(delta_eff / max(total_cp_events, 1))
+        rng: np.random.Generator = np.random.default_rng(self.random_state)
+        direction_results: list[dict[str, Any]] = []
+        for y_plus, y_minus in directions:
+            direction_results.append(
+                self._evaluate_decomp_direction_finite_grid_cp(
+                    y_plus=y_plus,
+                    y_minus=y_minus,
+                    grid=grids[f"{y_plus}{y_minus}"],
+                    c_n=c_n,
+                    alpha_cp=alpha_cp,
+                    rng=rng,
+                    n_plus=n_plus,
+                    n_minus=n_minus,
+                )
+            )
+
+        best_direction: dict[str, Any] = max(direction_results, key=lambda r: r["eps_lower_x"])
+        eps_rr: float = float(self.epsilon)
+        eps_emp_total: float = float(best_direction["eps_emp_x"] + eps_rr)
+        eps_lower_total: float = float(best_direction["eps_lower_x"] + eps_rr)
+        eps_upper_total: float = float(best_direction["eps_upper_x"] + eps_rr)
+
+        self.eps_emp = eps_emp_total
+        self.eps_ci = (eps_lower_total, eps_upper_total)
+        result: dict[str, Any] = {
+            "eps_emp": eps_emp_total,
+            "eps_ci": self.eps_ci,
+            "eps_lower": eps_lower_total,
+            "eps_upper": eps_upper_total,
+            "eps_emp_x": float(best_direction["eps_emp_x"]),
+            "eps_lower_x": float(best_direction["eps_lower_x"]),
+            "eps_upper_x": float(best_direction["eps_upper_x"]),
+            "eps_rr": eps_rr,
+            "beta": beta_float,
+            "c_n": c_n,
+            "h_n": h_n,
+            "L_log": L_log,
+            "L_tail": self.true_score_tail_lipschitz_bound(),
+            "lipschitz_c_floor": c_for_lipschitz,
+            "failure_delta": delta_eff,
+            "alpha_cp": alpha_cp,
+            "total_cp_events": int(total_cp_events),
+            "n_min": int(n_min),
+            "N_plus_eval": int(n_plus),
+            "N_minus_eval": int(n_minus),
+            "best_direction": str(best_direction["direction"]),
+            "tau": float(best_direction["tau"]),
+            "tau_grid_size": int(best_direction["tau_grid_size"]),
+            "tau_grid_feasible_size": int(best_direction["tau_grid_feasible_size"]),
+            "direction_results": direction_results,
+        }
+        self.last_decomp_grid_result = result
+
+        print("=== finite-grid decomp CP-LCB DEBUG ===")
+        print(f"eps={self.epsilon}, seed={self.random_state}, beta={beta_float}, n_min={n_min}")
+        print(f"c_n={c_n:.6g}, L_log={L_log:.6g}, h_n={h_n:.6g}, alpha_cp={alpha_cp:.6g}")
+        print(
+            "grid_sizes="
+            + ", ".join(f"{key}:{grid.size}" for key, grid in grids.items())
+        )
+        print(f"best_direction={best_direction['direction']}, tau={best_direction['tau']:.6g}")
+        print(f"eps_lower_x={best_direction['eps_lower_x']:.6g}, eps_lower_total={eps_lower_total:.6g}")
+        print("=== /finite-grid decomp CP-LCB DEBUG ===")
+        return result
+
     def evaluate_eps_with_dp_sniper_cp(
         self,
         tau: float,
@@ -1462,8 +1815,8 @@ class LDPAuditor:
         rng: np.random.Generator = np.random.default_rng(self.random_state)
 
         # val 用 rng / test 用 rng を分離
-        rng_val: Generator = np.random.default_rng(rng.integers(1 << 32))
-        rng_test: Generator = np.random.default_rng(rng.integers(1 << 32))
+        rng_val: np.random.Generator = np.random.default_rng(rng.integers(1 << 32))
+        rng_test: np.random.Generator = np.random.default_rng(rng.integers(1 << 32))
 
         # ------------- 検証（検証用データで最適な tau を決める） --------------
         # N_sniper 回ぶんの (x_i, ytilde_i) を作る
@@ -1566,7 +1919,7 @@ class LDPAuditor:
 
         return float(self.eps_emp)
 
-    ############# indirect LRT 監査用の関数 #############
+    ############# decomp LRT 監査用の関数 #############
     def _run_lrt_indirect_once(self) -> float:
         """
         攻撃者：
@@ -1609,7 +1962,7 @@ class LDPAuditor:
         self.eps_emp = max(a_emp01, a_emp10) + eps_grr
         self.eps_ci = (float(max(a_lo01, a_lo10) + eps_grr), float(max(a_hi01, a_hi10) + eps_grr))
 
-        print("=== indirect LRT DEBUG ===")
+        print("=== decomp LRT DEBUG ===")
         print(f"eps={self.epsilon}, seed={self.random_state}, c={self.c}")
         print(f"tau_null0={tau_null0:.6g}, q_null0q={q_null0:.6g}")
         print(f"a_lo10={a_lo10:.6g}, a_hi10={a_hi10:.6g}")
@@ -1617,7 +1970,7 @@ class LDPAuditor:
         print(f"a_lo01={a_lo01:.6g}, a_hi01={a_hi01:.6g}")
         print(f"eps_emp=a+eps_grr={self.eps_emp:.6g}")
         print(f"eps_ci=({self.eps_ci[0]:.6g}, {self.eps_ci[1]:.6g})")
-        print("=== /indirect LRT DEBUG ===")
+        print("=== /decomp LRT DEBUG ===")
 
         return float(self.eps_emp)
 
@@ -2311,8 +2664,8 @@ class LDPAuditor:
                 pass
             self.nb_cores = 1
             return self._run_lrt_tilde_y_alt_once()       
-        elif protocol_name == "LRT_indirect":
-            # indirect LRT も Ray 不要。確実に止める
+        elif protocol_name in ("LRT_decomp", "LRT_indirect"):
+            # decomp LRT も Ray 不要。確実に止める
             try:
                 ray.shutdown()
             except Exception:
