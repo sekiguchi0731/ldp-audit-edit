@@ -97,6 +97,7 @@ class EtaModelConfig:
     needs_scaling: bool
     builder: Callable[[dict[str, Any], int], Any]  # (params, seed) -> estimator
     direct_input: bool = False
+    reuse_fitted_model: bool = False
 
 
 class LibFFMClassifier:
@@ -371,6 +372,21 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
         patience: int = 20,
         device: str = "auto",
         model_name: str = "Torch MLP",
+        activation: str = "relu",
+        dropout_rate: float = 0.0,
+        optimizer_name: str = "adamw",
+        momentum_start: float = 0.9,
+        momentum_end: float = 0.99,
+        momentum_ramp_epochs: int = 200,
+        learning_rate_decay: float = 1.0,
+        min_learning_rate: float = 1e-6,
+        min_epochs: int = 0,
+        relative_improvement: float = 0.0,
+        input_scaling: str = "none",
+        first_layer_init_std: float | None = None,
+        hidden_layer_init_std: float | None = None,
+        output_layer_init_std: float | None = None,
+        validation_batch_size: int = 16384,
         seed: int | None = None,
     ) -> None:
         # Keep constructor parameters unchanged so sklearn.clone/get_params can
@@ -384,12 +400,30 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
         self.patience: int = patience
         self.device: str = device
         self.model_name: str = model_name
+        self.activation: str = activation
+        self.dropout_rate: float = dropout_rate
+        self.optimizer_name: str = optimizer_name
+        self.momentum_start: float = momentum_start
+        self.momentum_end: float = momentum_end
+        self.momentum_ramp_epochs: int = momentum_ramp_epochs
+        self.learning_rate_decay: float = learning_rate_decay
+        self.min_learning_rate: float = min_learning_rate
+        self.min_epochs: int = min_epochs
+        self.relative_improvement: float = relative_improvement
+        self.input_scaling: str = input_scaling
+        self.first_layer_init_std: float | None = first_layer_init_std
+        self.hidden_layer_init_std: float | None = hidden_layer_init_std
+        self.output_layer_init_std: float | None = output_layer_init_std
+        self.validation_batch_size: int = validation_batch_size
         self.seed: int | None = seed
 
         self.device_: str | None = None
         self._model: Any | None = None
         self._input_dim: int | None = None
         self._is_fitted: bool = False
+        self._input_center: np.ndarray | None = None
+        self._input_scale: np.ndarray | None = None
+        self._positive_mean_mask: np.ndarray | None = None
 
     def fit(self, X: np.ndarray | pd.DataFrame, y: np.ndarray) -> "TorchMLPClassifier":
         return self.fit_with_validation(X, y, None, None)
@@ -414,7 +448,9 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(int(self.seed))
 
-        X_np: np.ndarray = self._as_float32_matrix(X)
+        X_np_raw: np.ndarray = self._as_float32_matrix(X)
+        self._fit_input_scaler(X_np_raw)
+        X_np: np.ndarray = self._transform_input(X_np_raw)
         y_np: np.ndarray = np.asarray(y, dtype=np.float32).reshape(-1, 1)
         if X_np.shape[0] != y_np.shape[0]:
             raise ValueError(
@@ -422,7 +458,9 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
             )
 
         X_val_np: np.ndarray | None = (
-            self._as_float32_matrix(X_val) if X_val is not None else None
+            self._transform_input(self._as_float32_matrix(X_val))
+            if X_val is not None
+            else None
         )
         y_val_np: np.ndarray | None = (
             np.asarray(y_val, dtype=np.float32).reshape(-1, 1)
@@ -450,6 +488,10 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
                 "hidden_layer_sizes": self.hidden_layer_sizes,
                 "alpha": self.alpha,
                 "learning_rate_init": self.learning_rate_init,
+                "activation": self.activation,
+                "dropout_rate": self.dropout_rate,
+                "optimizer_name": self.optimizer_name,
+                "input_scaling": self.input_scaling,
                 "device": self.device_,
             },
         )
@@ -457,11 +499,24 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
         train_x_t: torch.Tensor = torch.from_numpy(X_np).to(device)
         train_y_t: torch.Tensor = torch.from_numpy(y_np).to(device)
         batch_size: int = max(1, min(self.batch_size, X_np.shape[0]))
-        optimizer = torch.optim.AdamW(
-            self._model.parameters(),
-            lr=self.learning_rate_init,
-            weight_decay=self.alpha,
-        )
+        optimizer_name: str = str(self.optimizer_name).strip().lower()
+        if optimizer_name == "adamw":
+            optimizer = torch.optim.AdamW(
+                self._model.parameters(),
+                lr=self.learning_rate_init,
+                weight_decay=self.alpha,
+            )
+        elif optimizer_name == "sgd":
+            optimizer = torch.optim.SGD(
+                self._model.parameters(),
+                lr=self.learning_rate_init,
+                momentum=self.momentum_start,
+                weight_decay=self.alpha,
+            )
+        else:
+            raise ValueError(
+                f"Unknown optimizer_name={self.optimizer_name!r}; use 'adamw' or 'sgd'."
+            )
 
         def loss_fn(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
             signed_targets: torch.Tensor = targets.mul(2.0).sub(1.0)
@@ -477,7 +532,17 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
         best_val_loss: float = np.inf
         epochs_without_improvement: int = 0
 
-        for _epoch in range(max(1, self.max_epochs)):
+        for epoch in range(max(1, self.max_epochs)):
+            if optimizer_name == "sgd":
+                ramp_epochs: int = max(1, int(self.momentum_ramp_epochs))
+                ramp_fraction: float = min(float(epoch) / float(ramp_epochs), 1.0)
+                momentum: float = float(
+                    self.momentum_start
+                    + ramp_fraction * (self.momentum_end - self.momentum_start)
+                )
+                for group in optimizer.param_groups:
+                    group["momentum"] = momentum
+
             self._model.train()
             order: torch.Tensor = torch.randperm(train_x_t.shape[0], device=device)
             for start in range(0, train_x_t.shape[0], batch_size):
@@ -489,25 +554,49 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
                 loss: torch.Tensor = loss_fn(logits, yb)
                 loss.backward()
                 optimizer.step()
+                if self.learning_rate_decay > 1.0:
+                    for group in optimizer.param_groups:
+                        group["lr"] = max(
+                            float(self.min_learning_rate),
+                            float(group["lr"]) / float(self.learning_rate_decay),
+                        )
 
             if val_x_t is None or val_y_t is None:
                 continue
 
             self._model.eval()
             with torch.no_grad():
-                val_loss: float = float(
-                    loss_fn(self._model(val_x_t), val_y_t).detach().cpu().item()
+                val_loss: float = self._mean_loss_in_batches(
+                    val_x_t,
+                    val_y_t,
+                    loss_fn=loss_fn,
                 )
-            if val_loss + 1e-7 < best_val_loss:
+            previous_best: float = best_val_loss
+            if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_state = {
                     k: v.detach().cpu().clone()
                     for k, v in self._model.state_dict().items()
                 }
+
+            improvement_threshold: float = max(
+                1e-7,
+                abs(previous_best) * float(self.relative_improvement)
+                if np.isfinite(previous_best)
+                else 1e-7,
+            )
+            improved_enough: bool = (
+                not np.isfinite(previous_best)
+                or val_loss < previous_best - improvement_threshold
+            )
+            if improved_enough:
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
-                if epochs_without_improvement >= self.patience:
+                if (
+                    epoch + 1 >= max(1, int(self.min_epochs))
+                    and epochs_without_improvement >= self.patience
+                ):
                     break
 
         if best_state is not None:
@@ -526,7 +615,7 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
             )
         import torch
 
-        X_np: np.ndarray = self._as_float32_matrix(X)
+        X_np: np.ndarray = self._transform_input(self._as_float32_matrix(X))
         device: torch.device = torch.device(self.device_)
         self._model.eval()
         probs: list[np.ndarray] = []
@@ -547,6 +636,62 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
     def cleanup(self) -> None:
         self._model = None
 
+    def _fit_input_scaler(self, X: np.ndarray) -> None:
+        scaling: str = str(self.input_scaling).strip().lower()
+        if scaling == "none":
+            self._input_center = None
+            self._input_scale = None
+            self._positive_mean_mask = None
+            return
+        if scaling != "paper":
+            raise ValueError(
+                f"Unknown input_scaling={self.input_scaling!r}; use 'none' or 'paper'."
+            )
+
+        positive_mean_mask: np.ndarray = np.all(X > 0.0, axis=0)
+        center: np.ndarray = np.mean(X, axis=0, dtype=np.float64).astype(np.float32) #type: ignore
+        scale: np.ndarray = np.std(X, axis=0, dtype=np.float64).astype(np.float32)
+        scale = np.where(scale > 0.0, scale, 1.0).astype(np.float32)
+        positive_means: np.ndarray = np.where(np.abs(center) > 0.0, center, 1.0)
+        center = center.copy()
+        scale = scale.copy()
+        center[positive_mean_mask] = 0.0
+        scale[positive_mean_mask] = positive_means[positive_mean_mask]
+
+        self._input_center = center
+        self._input_scale = scale
+        self._positive_mean_mask = positive_mean_mask
+
+    def _transform_input(self, X: np.ndarray) -> np.ndarray:
+        if self._input_center is None or self._input_scale is None:
+            return X
+        return np.ascontiguousarray(
+            (X - self._input_center) / self._input_scale,
+            dtype=np.float32,
+        )
+
+    def _mean_loss_in_batches(
+        self,
+        X: Any,
+        y: Any,
+        *,
+        loss_fn: Callable[[Any, Any], Any],
+    ) -> float:
+        if self._model is None:
+            raise RuntimeError("Model is not initialized.")
+        batch_size: int = max(1, int(self.validation_batch_size))
+        total_loss: float = 0.0
+        total_count: int = 0
+        for start in range(0, int(X.shape[0]), batch_size):
+            xb = X[start : start + batch_size]
+            yb = y[start : start + batch_size]
+            batch_count: int = int(xb.shape[0])
+            total_loss += float(
+                loss_fn(self._model(xb), yb).detach().cpu().item()
+            ) * batch_count
+            total_count += batch_count
+        return total_loss / max(total_count, 1)
+
     @staticmethod
     def _as_float32_matrix(X: Any) -> np.ndarray:
         if X is None:
@@ -563,12 +708,48 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
     def _build_model(self, input_dim: int, nn: Any) -> Any:
         layers: list[Any] = []
         prev = int(input_dim)
-        for hidden_dim in self.hidden_layer_sizes:
-            layers.append(nn.Linear(prev, int(hidden_dim)))
-            layers.append(nn.ReLU())
+        activation_name: str = str(self.activation).strip().lower()
+        for layer_idx, hidden_dim in enumerate(self.hidden_layer_sizes):
+            linear = nn.Linear(prev, int(hidden_dim))
+            self._initialize_linear_layer(
+                linear,
+                std=(
+                    self.first_layer_init_std
+                    if layer_idx == 0
+                    else self.hidden_layer_init_std
+                ),
+                nn=nn,
+            )
+            layers.append(linear)
+            if activation_name == "relu":
+                layers.append(nn.ReLU())
+            elif activation_name == "tanh":
+                layers.append(nn.Tanh())
+            else:
+                raise ValueError(
+                    f"Unknown activation={self.activation!r}; use 'relu' or 'tanh'."
+                )
+            if (
+                self.dropout_rate > 0.0
+                and layer_idx == len(self.hidden_layer_sizes) - 1
+            ):
+                layers.append(nn.Dropout(p=float(self.dropout_rate)))
             prev = int(hidden_dim)
-        layers.append(nn.Linear(prev, 1))
+        output = nn.Linear(prev, 1)
+        self._initialize_linear_layer(
+            output,
+            std=self.output_layer_init_std,
+            nn=nn,
+        )
+        layers.append(output)
         return nn.Sequential(*layers)
+
+    @staticmethod
+    def _initialize_linear_layer(linear: Any, *, std: float | None, nn: Any) -> None:
+        if std is None:
+            return
+        nn.init.normal_(linear.weight, mean=0.0, std=float(std))
+        nn.init.zeros_(linear.bias)
 
 
 def _build_logreg(params: dict[str, Any], seed: int) -> LogisticRegression:
@@ -620,6 +801,17 @@ def _build_torch_mlp(params: dict[str, Any], seed: int) -> TorchMLPClassifier:
 
 def _build_torch_dnn(params: dict[str, Any], seed: int) -> TorchMLPClassifier:
     return TorchMLPClassifier(seed=seed, model_name="Torch DNN", **params)
+
+
+def _build_torch_dnn_paper(
+    params: dict[str, Any],
+    seed: int,
+) -> TorchMLPClassifier:
+    return TorchMLPClassifier(
+        seed=seed,
+        model_name="Torch DNN (Baldi et al. 2014)",
+        **params,
+    )
 
 
 def _build_libffm(params: dict[str, Any], seed: int) -> LibFFMClassifier:
@@ -870,6 +1062,60 @@ def get_torch_dnn_eta_model_configs(
             for lr in [1e-4, 1e-3, 1e-2]
         ]
     return [EtaModelConfig("torch_dnn", grid, True, _build_torch_dnn)]
+
+
+def get_torch_dnn_paper_eta_model_configs(
+    *,
+    device: str = "auto",
+) -> list[EtaModelConfig]:
+    """
+    Fixed SUSY DNN preset based on Baldi, Sadowski, and Whiteson (2014).
+
+    The paper's best SUSY model used five 300-unit tanh hidden layers and
+    50% dropout on the top hidden layer. Training used minibatch SGD with
+    momentum ramped from 0.9 to 0.99 over 200 epochs, per-update learning-rate
+    decay, and up to roughly 1000 epochs.
+
+    Input scaling follows the paper using training-set statistics only:
+    general features are standardized, while features strictly greater than
+    zero are divided by their mean. The original paper used statistics from
+    the full train/test data; avoiding that leakage is the intentional
+    difference here.
+    """
+    paper_config: dict[str, Any] = {
+        "hidden_layer_sizes": (300, 300, 300, 300, 300),
+        "alpha": 1e-5,
+        "learning_rate_init": 0.05,
+        "device": device,
+        "max_epochs": 1000,
+        "patience": 40,
+        "batch_size": 100,
+        "activation": "tanh",
+        "dropout_rate": 0.5,
+        "optimizer_name": "sgd",
+        "momentum_start": 0.9,
+        "momentum_end": 0.99,
+        "momentum_ramp_epochs": 200,
+        "learning_rate_decay": 1.0000003,
+        "min_learning_rate": 1e-6,
+        "min_epochs": 200,
+        "relative_improvement": 1e-5,
+        "input_scaling": "paper",
+        "first_layer_init_std": 0.1,
+        "hidden_layer_init_std": 0.05,
+        "output_layer_init_std": 0.001,
+        "validation_batch_size": 16384,
+    }
+    return [
+        EtaModelConfig(
+            "torch_dnn_paper",
+            [paper_config],
+            False,
+            _build_torch_dnn_paper,
+            direct_input=True,
+            reuse_fitted_model=True,
+        )
+    ]
 
 
 def get_libffm_eta_model_configs(

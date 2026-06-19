@@ -23,6 +23,7 @@ from ldp_audit.eta_models import (
     get_default_eta_model_configs,
     get_fixed_logreg_eta_model_configs,
     get_torch_dnn_eta_model_configs,
+    get_torch_dnn_paper_eta_model_configs,
     get_libffm_eta_model_configs,
     get_reduced_eta_model_configs,
     get_torch_mlp_eta_model_configs,
@@ -107,7 +108,10 @@ def _resolve_eta_model_configs(cfg: EtaExperimentConfig) -> list[EtaModelConfig]
         requested = ["logreg"]
 
     needs_torch: bool = bool(
-        cfg.use_gpu or "torch_mlp" in requested or "torch_dnn" in requested
+        cfg.use_gpu
+        or "torch_mlp" in requested
+        or "torch_dnn" in requested
+        or "torch_dnn_paper" in requested
     )
     resolved_torch_device: str = resolve_torch_device(cfg.torch_device) if needs_torch else "cpu"
     if cfg.use_gpu:
@@ -149,6 +153,15 @@ def _resolve_eta_model_configs(cfg: EtaExperimentConfig) -> list[EtaModelConfig]
                 for model_cfg in get_torch_dnn_eta_model_configs(
                     device=cfg.torch_device,
                     reduced=cfg.use_reduced_grid,
+                )
+            }
+        )
+    if "torch_dnn_paper" in requested:
+        by_name.update(
+            {
+                model_cfg.name: model_cfg
+                for model_cfg in get_torch_dnn_paper_eta_model_configs(
+                    device=cfg.torch_device,
                 )
             }
         )
@@ -1203,8 +1216,14 @@ def run_eta_model_experiments(
         )
 
     # ---------- run seeds x eps ----------
+    reusable_model_names: set[str] = {
+        model_cfg.name
+        for model_cfg in eta_model_cfgs
+        if model_cfg.reuse_fitted_model
+    }
     for seed in tqdm(list(lst_seed), desc="ETA model comparison (per seed, per epsilon)"):
-        indirect_model_cache: dict[str, dict[str, dict[str, object]]] = {}
+        indirect_model_cache: dict[str, dict[str, object]] = {}
+        reusable_model_cache: dict[str, dict[str, dict[str, object]]] = {}
         for epsilon in eps_list:
             logging.info(
                 "Running eta-model comparison for seed=%s, epsilon=%s",
@@ -1213,9 +1232,14 @@ def run_eta_model_experiments(
             )
             auditor.set_params(epsilon=float(epsilon), k=cfg.k, random_state=int(seed))
 
-            prefit_cache: dict[str, dict[str, dict[str, object]]] | None = None
-            if "indirect_LRT_hat" in report_attacks and "indirect_LRT_hat" in indirect_model_cache:
-                prefit_cache = {"indirect_LRT_hat": indirect_model_cache["indirect_LRT_hat"]}
+            prefit_cache_data: dict[str, dict[str, dict[str, object]]] = {}
+            if indirect_model_cache:
+                prefit_cache_data["indirect_LRT_hat"] = dict(indirect_model_cache)
+            for attack_name, model_best in reusable_model_cache.items():
+                prefit_cache_data.setdefault(str(attack_name), {}).update(model_best)
+            prefit_cache: dict[str, dict[str, dict[str, object]]] | None = (
+                prefit_cache_data if prefit_cache_data else None
+            )
 
             out: dict = auditor.run_eta_model_comparison_4way(
                 seed=int(seed),
@@ -1240,10 +1264,18 @@ def run_eta_model_experiments(
                 dict[str, dict[str, dict[str, object]]],
                 out.get("model_best_by_attack", {}),
             )
-            if "indirect_LRT_hat" in report_attacks and "indirect_LRT_hat" not in indirect_model_cache:
-                indirect_best: dict[str, dict[str, object]] | None = model_best_by_attack.get("indirect_LRT_hat")
+            if not indirect_model_cache:
+                indirect_best = model_best_by_attack.get("indirect_LRT_hat")
                 if indirect_best is not None:
-                    indirect_model_cache["indirect_LRT_hat"] = indirect_best
+                    indirect_model_cache = dict(indirect_best)
+            for attack_name, model_best in model_best_by_attack.items():
+                reusable_best: dict[str, dict[str, object]] = {
+                    model_name: best
+                    for model_name, best in model_best.items()
+                    if model_name in reusable_model_names
+                }
+                if reusable_best:
+                    reusable_model_cache[str(attack_name)] = reusable_best
             prior_info: dict[str, float] = cast(dict[str, float], out.get("eta_class_prior", {}))
 
             for model_name, info in out["results"].items():
@@ -1469,11 +1501,18 @@ def run_eta_model_experiments(
                         params_json=params_json_by_attack.get(str(attack_name)),
                         attack_for_report=str(attack_name),
                     )
-        for per_model_best in indirect_model_cache.values():
-            for best in per_model_best.values():
-                cleanup_model: Any | None = getattr(best.get("model"), "cleanup", None)
-                if callable(cleanup_model):
-                    cleanup_model()
+        cleaned_model_ids: set[int] = set()
+        cached_best_entries: list[dict[str, object]] = list(indirect_model_cache.values())
+        for per_attack_best in reusable_model_cache.values():
+            cached_best_entries.extend(per_attack_best.values())
+        for best in cached_best_entries:
+            model: object | None = best.get("model")
+            if model is None or id(model) in cleaned_model_ids:
+                continue
+            cleanup_model: Any | None = getattr(model, "cleanup", None)
+            if callable(cleanup_model):
+                cleanup_model()
+            cleaned_model_ids.add(id(model))
 
     df = pd.DataFrame(rows)
 
@@ -1560,12 +1599,14 @@ if __name__ == "__main__":
             "ffm",
             "torch_mlp",
             "torch_dnn",
+            "torch_dnn_paper",
             "all",
         ],
         default=["logreg", "svm_rbf", "rf", "mlp"],
         help=(
             "Eta model families to run. Add 'ffm' to use libffm, add "
-            "'torch_mlp' or 'torch_dnn' to use optional PyTorch neural nets, "
+            "'torch_mlp', 'torch_dnn', or 'torch_dnn_paper' to use optional "
+            "PyTorch neural nets, "
             "or use 'all' for non-torch baseline families."
         ),
     )
@@ -1927,3 +1968,18 @@ if __name__ == "__main__":
 #   > torch_mlp_criteo.log 2>&1 &
 
 # echo $!
+
+# CUDA_VISIBLE_DEVICES=0 nohup python experiment_eta_model.py \
+#   --real_data \
+#   --real_data_path ./data/SUSY/SUSY.csv \
+#   --real_data_name SUSY \
+#   --eta_models torch_dnn_paper \
+#   --torch_device cuda \
+#   --N_total all \
+#   --N_ratio 0.8,0.05,0.05,0.1 \
+#   --epsilon_list 0.25 0.5 0.75 1.0 2.0 4.0 6.0 10.0 \
+#   --evaluate_both_reports \
+#   --seed_start 0 \
+#   --seed_end 5 \
+#   --output_root ./results/20260616/susy_dnn_paper \
+#   > susy_dnn_paper.log 2>&1 &

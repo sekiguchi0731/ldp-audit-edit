@@ -1183,15 +1183,13 @@ class LDPAuditor:
             selection_attack_list.append(cast(Literal["complete_LRT_hat", "indirect_LRT_hat"], attack_name))
 
         per_attack_model_best: dict[str, dict[str, dict[str, Any]]] = {}
+        reusable_model_best: dict[str, dict[str, Any]] = {}
         for selection_attack in selection_attack_list:
             cached_best: dict[str, dict[str, Any]] | None = (
                 prefit_model_best_by_attack.get(str(selection_attack))
                 if prefit_model_best_by_attack is not None
                 else None
             )
-            if cached_best is not None:
-                per_attack_model_best[str(selection_attack)] = cached_best
-                continue
 
             score_fn: Callable[..., float] = self._select_score_fn_for_eta_model(
                 X_val=X_val,
@@ -1205,6 +1203,23 @@ class LDPAuditor:
 
             per_model_best: dict[str, dict[str, Any]] = {}
             for cfg in cfgs:
+                cached_cfg_best: dict[str, Any] | None = (
+                    cached_best.get(cfg.name) if cached_best is not None else None
+                )
+                if cached_cfg_best is not None:
+                    best = dict(cached_cfg_best)
+                    best["score"] = float(score_fn(best["model"]))
+                    per_model_best[cfg.name] = best
+                    if cfg.reuse_fitted_model:
+                        reusable_model_best[cfg.name] = best
+                    continue
+
+                if cfg.reuse_fitted_model and cfg.name in reusable_model_best:
+                    best = dict(reusable_model_best[cfg.name])
+                    best["score"] = float(score_fn(best["model"]))
+                    per_model_best[cfg.name] = best
+                    continue
+
                 # best = {"score": s,"params": dict(params),"model": model}
                 # 各モデルごとに fit + select （val上で score_fn が最大となるハイパーパラメータを探索）
                 best: dict[str, Any] = fit_and_select_eta_model(
@@ -1217,6 +1232,8 @@ class LDPAuditor:
                     score_fn=score_fn,
                 )
                 per_model_best[cfg.name] = best
+                if cfg.reuse_fitted_model:
+                    reusable_model_best[cfg.name] = best
             per_attack_model_best[str(selection_attack)] = per_model_best
 
         # --- report: 各モデルの best を使って test評価（attack ごとに tau,q を作る） ---
