@@ -387,10 +387,11 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
         hidden_layer_init_std: float | None = None,
         output_layer_init_std: float | None = None,
         validation_batch_size: int = 16384,
+        max_dense_batch_bytes: int = 256 * 1024 * 1024,
         seed: int | None = None,
     ) -> None:
-        # Keep constructor parameters unchanged so sklearn.clone/get_params can
-        # treat this class as a regular estimator. Convert values only where
+        # Keep constructor parameters as plain attributes so sklearn.clone/get_params
+        # can treat this class as a regular estimator. Convert values only where
         # they are consumed during fitting.
         self.hidden_layer_sizes: tuple[int, ...] = hidden_layer_sizes
         self.alpha: float = alpha
@@ -415,6 +416,7 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
         self.hidden_layer_init_std: float | None = hidden_layer_init_std
         self.output_layer_init_std: float | None = output_layer_init_std
         self.validation_batch_size: int = validation_batch_size
+        self.max_dense_batch_bytes: int = max_dense_batch_bytes
         self.seed: int | None = seed
 
         self.device_: str | None = None
@@ -448,16 +450,16 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(int(self.seed))
 
-        X_np_raw: np.ndarray = self._as_float32_matrix(X)
+        X_np_raw: Any = self._as_float32_matrix(X)
         self._fit_input_scaler(X_np_raw)
-        X_np: np.ndarray = self._transform_input(X_np_raw)
+        X_np: Any = self._transform_input(X_np_raw)
         y_np: np.ndarray = np.asarray(y, dtype=np.float32).reshape(-1, 1)
         if X_np.shape[0] != y_np.shape[0]:
             raise ValueError(
                 f"X/y length mismatch: X has {X_np.shape[0]} rows, y has {y_np.shape[0]}."
             )
 
-        X_val_np: np.ndarray | None = (
+        X_val_np: Any | None = (
             self._transform_input(self._as_float32_matrix(X_val))
             if X_val is not None
             else None
@@ -492,13 +494,20 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
                 "dropout_rate": self.dropout_rate,
                 "optimizer_name": self.optimizer_name,
                 "input_scaling": self.input_scaling,
+                "batch_size": self.batch_size,
+                "effective_batch_size": self._effective_dense_batch_size(
+                    X_np,
+                    self.batch_size,
+                ),
                 "device": self.device_,
             },
         )
 
-        train_x_t: torch.Tensor = torch.from_numpy(X_np).to(device)
+        train_x_t: torch.Tensor | None = (
+            None if sparse.issparse(X_np) else torch.from_numpy(X_np).to(device)
+        )
         train_y_t: torch.Tensor = torch.from_numpy(y_np).to(device)
-        batch_size: int = max(1, min(self.batch_size, X_np.shape[0]))
+        batch_size: int = self._effective_dense_batch_size(X_np, self.batch_size)
         optimizer_name: str = str(self.optimizer_name).strip().lower()
         if optimizer_name == "adamw":
             optimizer = torch.optim.AdamW(
@@ -522,8 +531,12 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
             signed_targets: torch.Tensor = targets.mul(2.0).sub(1.0)
             return torch.nn.functional.softplus(-signed_targets * logits).mean()
 
-        val_x_t: torch.Tensor | None = (
-            torch.from_numpy(X_val_np).to(device) if X_val_np is not None else None
+        val_x: Any | None = (
+            None
+            if X_val_np is None
+            else X_val_np
+            if sparse.issparse(X_val_np)
+            else torch.from_numpy(X_val_np).to(device)
         )
         val_y_t: torch.Tensor | None = (
             torch.from_numpy(y_val_np).to(device) if y_val_np is not None else None
@@ -544,11 +557,22 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
                     group["momentum"] = momentum
 
             self._model.train()
-            order: torch.Tensor = torch.randperm(train_x_t.shape[0], device=device)
-            for start in range(0, train_x_t.shape[0], batch_size):
-                batch_idx: torch.Tensor = order[start : start + batch_size]
-                xb: torch.Tensor = train_x_t.index_select(0, batch_idx)
-                yb: torch.Tensor = train_y_t.index_select(0, batch_idx)
+            n_train: int = int(X_np.shape[0])
+            if sparse.issparse(X_np):
+                order_np: np.ndarray = torch.randperm(n_train).cpu().numpy()
+            else:
+                if train_x_t is None:
+                    raise RuntimeError("Dense training tensor was not initialized.")
+                order_t: torch.Tensor = torch.randperm(n_train, device=device)
+            for start in range(0, n_train, batch_size):
+                if sparse.issparse(X_np):
+                    batch_rows: np.ndarray = order_np[start : start + batch_size]
+                    xb = self._feature_batch_to_tensor(X_np, batch_rows, device)
+                    yb = self._target_batch_to_tensor(train_y_t, batch_rows, device)
+                else:
+                    batch_idx: torch.Tensor = order_t[start : start + batch_size]
+                    xb: torch.Tensor = train_x_t.index_select(0, batch_idx)
+                    yb: torch.Tensor = train_y_t.index_select(0, batch_idx)
                 optimizer.zero_grad(set_to_none=True)
                 logits: torch.Tensor = self._model(xb)
                 loss: torch.Tensor = loss_fn(logits, yb)
@@ -561,13 +585,13 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
                             float(group["lr"]) / float(self.learning_rate_decay),
                         )
 
-            if val_x_t is None or val_y_t is None:
+            if val_x is None or val_y_t is None:
                 continue
 
             self._model.eval()
             with torch.no_grad():
                 val_loss: float = self._mean_loss_in_batches(
-                    val_x_t,
+                    val_x,
                     val_y_t,
                     loss_fn=loss_fn,
                 )
@@ -615,15 +639,22 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
             )
         import torch
 
-        X_np: np.ndarray = self._transform_input(self._as_float32_matrix(X))
+        X_np: Any = self._transform_input(self._as_float32_matrix(X))
+        if self._input_dim is not None and int(X_np.shape[1]) != self._input_dim:
+            raise ValueError(
+                f"X has {X_np.shape[1]} columns, but the fitted model expects {self._input_dim}."
+            )
         device: torch.device = torch.device(self.device_)
         self._model.eval()
         probs: list[np.ndarray] = []
+        batch_size: int = self._effective_dense_batch_size(X_np, self.batch_size)
         with torch.no_grad():
-            for start in range(0, X_np.shape[0], max(1, self.batch_size)):
-                xb: torch.Tensor = torch.from_numpy(
-                    X_np[start : start + self.batch_size]
-                ).to(device)
+            for start in range(0, X_np.shape[0], batch_size):
+                xb: torch.Tensor = self._feature_batch_to_tensor(
+                    X_np,
+                    slice(start, start + batch_size),
+                    device,
+                )
                 p1: np.ndarray = (
                     torch.sigmoid(self._model(xb)).detach().cpu().numpy().reshape(-1)
                 )
@@ -636,7 +667,7 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
     def cleanup(self) -> None:
         self._model = None
 
-    def _fit_input_scaler(self, X: np.ndarray) -> None:
+    def _fit_input_scaler(self, X: Any) -> None:
         scaling: str = str(self.input_scaling).strip().lower()
         if scaling == "none":
             self._input_center = None
@@ -646,6 +677,11 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
         if scaling != "paper":
             raise ValueError(
                 f"Unknown input_scaling={self.input_scaling!r}; use 'none' or 'paper'."
+            )
+        if sparse.issparse(X):
+            raise ValueError(
+                "input_scaling='paper' is not supported for sparse inputs. "
+                "Use input_scaling='none' or densify/project features before fitting."
             )
 
         positive_mean_mask: np.ndarray = np.all(X > 0.0, axis=0)
@@ -662,9 +698,11 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
         self._input_scale = scale
         self._positive_mean_mask = positive_mean_mask
 
-    def _transform_input(self, X: np.ndarray) -> np.ndarray:
+    def _transform_input(self, X: Any) -> Any:
         if self._input_center is None or self._input_scale is None:
             return X
+        if sparse.issparse(X):
+            raise ValueError("Sparse input cannot be transformed by the dense input scaler.")
         return np.ascontiguousarray(
             (X - self._input_center) / self._input_scale,
             dtype=np.float32,
@@ -679,12 +717,21 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
     ) -> float:
         if self._model is None:
             raise RuntimeError("Model is not initialized.")
-        batch_size: int = max(1, int(self.validation_batch_size))
+        if self.device_ is None:
+            raise RuntimeError("Device is not initialized.")
+        import torch
+
+        device: torch.device = torch.device(self.device_)
+        batch_size: int = self._effective_dense_batch_size(
+            X,
+            self.validation_batch_size,
+        )
         total_loss: float = 0.0
         total_count: int = 0
         for start in range(0, int(X.shape[0]), batch_size):
-            xb = X[start : start + batch_size]
-            yb = y[start : start + batch_size]
+            batch_rows: slice[int, int, Any] = slice(start, start + batch_size)
+            xb = self._feature_batch_to_tensor(X, batch_rows, device)
+            yb = self._target_batch_to_tensor(y, batch_rows, device)
             batch_count: int = int(xb.shape[0])
             total_loss += float(
                 loss_fn(self._model(xb), yb).detach().cpu().item()
@@ -693,17 +740,61 @@ class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
         return total_loss / max(total_count, 1)
 
     @staticmethod
-    def _as_float32_matrix(X: Any) -> np.ndarray:
+    def _as_float32_matrix(X: Any) -> Any:
         if X is None:
             raise ValueError("X must not be None.")
         if sparse.issparse(X):
-            X = X.toarray()
+            arr_sparse = X.astype(np.float32, copy=False).tocsr()
+            if len(arr_sparse.shape) != 2:
+                raise ValueError(
+                    f"X must be 2-dimensional, got shape={arr_sparse.shape}."
+                )
+            return arr_sparse
         elif isinstance(X, pd.DataFrame):
             X = X.to_numpy()
         arr: np.ndarray = np.asarray(X, dtype=np.float32)
         if arr.ndim != 2:
             raise ValueError(f"X must be 2-dimensional, got shape={arr.shape}.")
         return np.ascontiguousarray(arr)
+
+    def _effective_dense_batch_size(self, X: Any, requested_batch_size: int) -> int:
+        n_rows: int = int(X.shape[0])
+        requested: int = max(1, min(int(requested_batch_size), max(n_rows, 1)))
+        if not sparse.issparse(X):
+            return requested
+        n_features: int = max(1, int(X.shape[1]))
+        bytes_per_row: int = n_features * np.dtype(np.float32).itemsize
+        byte_budget: int = max(bytes_per_row, int(self.max_dense_batch_bytes))
+        return max(1, min(requested, byte_budget // bytes_per_row))
+
+    def _feature_batch_to_tensor(self, X: Any, rows: Any, device: Any) -> Any:
+        import torch
+
+        if isinstance(X, torch.Tensor):
+            if isinstance(rows, slice):
+                return X[rows]
+            idx: torch.Tensor = torch.as_tensor(rows, dtype=torch.long, device=X.device)
+            return X.index_select(0, idx)
+        if sparse.issparse(X):
+            batch: Any = X[rows]
+            dense_batch: np.ndarray = batch.toarray()
+            arr: np.ndarray = np.asarray(dense_batch, dtype=np.float32)
+        else:
+            arr = np.asarray(X[rows], dtype=np.float32)
+        return torch.from_numpy(np.ascontiguousarray(arr)).to(device)
+
+    def _target_batch_to_tensor(self, y: Any, rows: Any, device: Any) -> Any:
+        import torch
+
+        if isinstance(y, torch.Tensor):
+            if isinstance(rows, slice):
+                return y[rows]
+            idx: torch.Tensor = torch.as_tensor(rows, dtype=torch.long, device=y.device)
+            return y.index_select(0, idx)
+        arr: np.ndarray = np.asarray(y[rows], dtype=np.float32)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        return torch.from_numpy(np.ascontiguousarray(arr)).to(device)
 
     def _build_model(self, input_dim: int, nn: Any) -> Any:
         layers: list[Any] = []
@@ -841,7 +932,11 @@ def _build_real_data_preprocessor(
         transformers.append(
             (
                 "cat",
-                OneHotEncoder(handle_unknown="ignore", sparse_output=True),
+                OneHotEncoder(
+                    handle_unknown="ignore",
+                    sparse_output=True,
+                    dtype=np.float32,
+                ),
                 categorical_cols,
             )
         )
@@ -850,7 +945,11 @@ def _build_real_data_preprocessor(
         transformers.append(
             (
                 "title",
-                CountVectorizer(binary=True, token_pattern=r"[^ ]+"),
+                CountVectorizer(
+                    binary=True,
+                    token_pattern=r"[^ ]+",
+                    dtype=np.float32,
+                ),
                 text_title_col,
             )
         )
